@@ -194,23 +194,47 @@ function printCard(res, color) {
   console.log('');
 }
 
-// group-chat line: colored bullet + name label, message flows with hanging indent
-function printChat(agent, text) {
+// group-chat message as lines: colored bullet + name label, body with hanging indent
+function chatLines(agent, text) {
   const paint = C(agent.color);
   const label = ('● ' + agent.name.toLowerCase()).padEnd(9);
   const indent = ' '.repeat(2 + label.length + 1);
-  const lines = wrap(text, Math.min(cols() - indent.length, 88));
-  console.log('  ' + paint(label) + ' ' + (lines[0] || ''));
-  for (const l of lines.slice(1)) console.log(indent + l);
+  const wrapped = wrap(text, Math.min(cols() - indent.length, 88));
+  const out = ['  ' + paint(label) + ' ' + (wrapped[0] || '')];
+  for (const l of wrapped.slice(1)) out.push(indent + l);
+  out.push('');                 // breathing room between messages
+  return out;
 }
 
-// "x & y are typing..." live indicator (one line, redrawn in place)
-function typingLine(typing, frame) {
-  if (!typing.size) return '';
-  const names = [...typing].map(n => n.toLowerCase());
-  const who = names.length === 1 ? names[0]
-    : names.slice(0, -1).join(', ') + ' & ' + names[names.length - 1];
-  return faint(`  ${who} ${names.length > 1 ? 'are' : 'is'} typing${'.'.repeat((frame % 3) + 1)}`);
+// per-agent buzzing glyphs (Nothing-style) for whoever is still typing
+function typingGlyphs(typing, frame) {
+  const parts = AGENTS.filter(a => typing.has(a.name)).map(a => {
+    const tr = Array.from({ length: 4 }, (_, i) => BRAILLE[(frame + i * 2 + a.name.length) % BRAILLE.length]).join('');
+    return `${dotOf(a)} ${C(a.color)(a.name.toLowerCase())} ${C(a.color)(tr)}`;
+  });
+  return parts.length ? '  ' + parts.join('   ') : '';
+}
+
+// sticky bottom "thinking" panel: shimmer dot-field + buzzing agent glyphs + hairline,
+// while chat messages are printed ABOVE it via .above()
+function thinkingStage(getTyping) {
+  const W = Math.min((cols() || 80) - 4, 44), H = 3;
+  let drawn = false, frame = 0;
+  const w = (s) => process.stdout.write(s);
+  function lines() {
+    const shim = '  ' + shimmer(W, frame);
+    const glyphs = typingGlyphs(getTyping(), frame) || ('  ' + faint('· · ·'));
+    const txt = ' swarm thinking ', dash = Math.max(0, W - txt.length), l = (dash / 2) | 0;
+    const label = '  ' + faint('┄'.repeat(l)) + grey(txt) + faint('┄'.repeat(dash - l));
+    return [shim, glyphs, label];
+  }
+  function draw() { if (drawn) w(`\x1b[${H}A`); w('\x1b[0J'); w(lines().join('\n') + '\n'); drawn = true; }
+  return {
+    start() { hide(); draw(); },
+    tick() { frame++; draw(); },
+    above(ls) { if (drawn) { w(`\x1b[${H}A`); drawn = false; } w('\x1b[0J'); for (const x of ls) w(x + '\n'); draw(); },
+    stop() { if (drawn) { w(`\x1b[${H}A`); drawn = false; } w('\x1b[0J'); show(); },
+  };
 }
 
 // treat "(pass)" / quoted-empty as silence
@@ -340,25 +364,23 @@ async function swarmRound(user) {
     history.push({ role: st.res.name, text: st.res.text });
   }
 }
-// one chat round: all agents type concurrently, messages drop into the timeline as they land
+// one chat round: all agents type concurrently under a live Nothing-style thinking panel;
+// each message drops into the timeline above the panel as that agent lands
 async function chatRound(agents) {
   const typing = new Set(agents.map(a => a.name));
-  let frame = 0;
   const posted = [];
-  hide();
-  process.stdout.write('\r\x1b[2K' + typingLine(typing, frame));
-  const anim = setInterval(() => { frame++; process.stdout.write('\r\x1b[2K' + typingLine(typing, frame)); }, 300);
+  const stage = thinkingStage(() => typing);
+  stage.start();
+  const anim = setInterval(() => stage.tick(), 110);
   await Promise.all(agents.map(a =>
     runAgent(a, chatPrompt(a)).then(res => {
       typing.delete(a.name);
-      process.stdout.write('\r\x1b[2K');                 // clear the typing line
       const text = stripPass(res.text);
-      if (text) { printChat(a, text); history.push({ role: a.name, text }); posted.push(a.name); }
-      process.stdout.write(typingLine(typing, frame));    // redraw remaining typers below
+      if (text) { stage.above(chatLines(a, text)); history.push({ role: a.name, text }); posted.push(a.name); }
     })
   ));
   clearInterval(anim);
-  process.stdout.write('\r\x1b[2K'); show();
+  stage.stop();
   return posted;
 }
 
