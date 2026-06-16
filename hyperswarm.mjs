@@ -107,24 +107,31 @@ const AGENTS = [
 const NAMES = AGENTS.map(a => a.name);
 
 // ---------- spawn one agent ----------
-function runAgent(agent, promptText) {
+function runAgent(agent, promptText, signal) {
   return new Promise((resolve) => {
     const spec = agent.build(promptText);
     const child = spawn(spec.cmd, spec.args, { shell: !!spec.shell, windowsHide: true });
-    let out = '', err = '';
-    const timer = setTimeout(() => { try { child.kill(); } catch {} }, 240000);
+    let out = '', err = '', settled = false;
+    const kill = () => { try { child.kill(); } catch {} };
+    const timer = setTimeout(kill, 120000);              // hard backstop
+    const onAbort = kill;                                 // straggler cut-off from the round
+    if (signal) { if (signal.aborted) kill(); else signal.addEventListener('abort', onAbort, { once: true }); }
+    const done = (text, ok) => {
+      if (settled) return; settled = true;
+      clearTimeout(timer); if (signal) try { signal.removeEventListener('abort', onAbort); } catch {}
+      resolve({ name: agent.name, text, ok });
+    };
     child.stdout.on('data', d => out += d);
     child.stderr.on('data', d => err += d);
-    if (spec.stdin != null) { child.stdin.write(spec.stdin); child.stdin.end(); }
+    if (spec.stdin != null) { try { child.stdin.write(spec.stdin); child.stdin.end(); } catch {} }
     else { try { child.stdin.end(); } catch {} }
-    child.on('error', e => { clearTimeout(timer); resolve({ name: agent.name, text: `(failed to launch: ${e.message})`, ok: false }); });
+    child.on('error', e => done(`(failed to launch: ${e.message})`, false));
     child.on('close', () => {
-      clearTimeout(timer);
       let text = out;
       if (spec.outFile) { try { const f = readFileSync(spec.outFile, 'utf8').trim(); if (f) text = f; } catch {} }
       text = clean(text);
-      if (!text) text = clean(err) || '(no response)';
-      resolve({ name: agent.name, text, ok: true });
+      if (!text) text = usableErr(err) || '(no response)';
+      done(text, true);
     });
   });
 }
@@ -134,6 +141,14 @@ function clean(s) {
     .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')   // strip ANSI color codes
     .replace(/\r/g, '')
     .trim();
+}
+
+// stderr is only a fallback when stdout is empty; drop harmless CLI warnings so they never post as a message
+function usableErr(err) {
+  return clean(err).split('\n').filter(l => l.trim() &&
+    !/^Warning:/i.test(l) && !/256-color/i.test(l) && !/Ripgrep is not available/i.test(l) &&
+    !/Falling back to/i.test(l) && !/DeprecationWarning|ExperimentalWarning|\(node:|--trace-/i.test(l)
+  ).join('\n').trim();
 }
 
 // ---------- swarm UI ----------
@@ -316,6 +331,7 @@ function chatPrompt(agent) {
     `Chat like a real group chat: short (1-3 sentences), casual, reactive. Lowercase is fine.`,
     `Talk WITH the group, not just to the human - agree, disagree, build on a point, or @mention someone (e.g. @${others[0].toLowerCase()}). React to the most recent messages.`,
     `Never repeat a point already made. If you have nothing worth adding right now, reply with exactly: (pass)`,
+    `This is a text-only chat: do NOT use tools, run commands, browse, or read files - just reply from your own knowledge.`,
     `No preamble, no sign-off, no "as an AI". Output only your chat message as ${agent.name}.`,
     ``,
     `Chat so far:`,
@@ -327,6 +343,7 @@ function chatPrompt(agent) {
 function soloPrompt(agent, user) {
   return [
     `You are ${agent.name}. Answer the user directly and concisely. Speak in first person as ${agent.name}.`,
+    `This is a text-only chat: do NOT use tools, run commands, browse, or read files - just answer from your own knowledge.`,
     history.length ? `\nRecent conversation (context):\n${histText()}\n` : ``,
     `\nUser request:\n${user}\n\nYour response:`,
   ].join('\n');
@@ -337,6 +354,7 @@ function swarmPrompt(agent, user) {
   return [
     `You are ${agent.name}, part of a four-AI swarm in a shared terminal (alongside ${others}).`,
     `All four of you are answering THIS prompt at the same time, so give your own best, distinctive take - don't wait for or defer to the others.`,
+    `This is a text-only chat: do NOT use tools, run commands, browse, or read files - just answer from your own knowledge.`,
     `Be concise and direct. No preamble, no sign-off. Speak in first person as ${agent.name}.`,
     history.length ? `\nRecent conversation (context):\n${histText()}\n` : ``,
     `\nUser request:\n${user}\n\nYour response as ${agent.name}:`,
@@ -372,11 +390,17 @@ async function chatRound(agents) {
   const stage = thinkingStage(() => typing);
   stage.start();
   const anim = setInterval(() => stage.tick(), 110);
-  await Promise.all(agents.map(a =>
-    runAgent(a, chatPrompt(a)).then(res => {
+  const ac = new AbortController();
+  let graceArmed = false;
+  await Promise.allSettled(agents.map(a =>
+    runAgent(a, chatPrompt(a), ac.signal).then(res => {
       typing.delete(a.name);
       const text = stripPass(res.text);
-      if (text) { stage.above(chatLines(a, text)); history.push({ role: a.name, text }); posted.push(a.name); }
+      if (text && !/^\((no response|failed to launch)/.test(text)) {
+        stage.above(chatLines(a, text)); history.push({ role: a.name, text }); posted.push(a.name);
+      }
+      // once someone has replied, give stragglers a bounded grace then cut them off (prevents a hung agent freezing the round)
+      if (!graceArmed) { graceArmed = true; setTimeout(() => ac.abort(), 35000); }
     })
   ));
   clearInterval(anim);
