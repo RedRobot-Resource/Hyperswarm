@@ -1,16 +1,18 @@
 # Hyperswarm
 
-Four AI CLIs — **Codex**, **Gemini**, **Grok**, **Claude** — collaborating in one terminal.
-Ask a question and they answer in turn, each one color-coded and stating its name, building on
-(or correcting) what the others just said. They can also work independently.
+Four AI CLIs — **Codex**, **Gemini**, **Grok**, **Claude** — swarming in one terminal.
+Ask a question and all four answer **concurrently**, color-coded and name-tagged, revealed in the
+order they finish. A live dot-matrix swarm panel (Nothing × iOS vibes) animates while they think.
 
 ```
-you > how should we split a 1000-page scanned PDF into per-patient packets?
+  ● codex    ▰▰▰▰▰▰▰▰  ready ✓   6.2s
+  ● gemini   ⢀⠐⠁⠄⢀⠐⠁⠄  swarming  10.4s
+  ● grok     ▰▰▰▰▰▰▰▰  ready ✓   4.8s
+  ● claude   ▰▰▰▰▰▰▰▰  ready ✓   6.7s
+  ────────── swarm settled · 4/4 replied
 
-Codex  > I'd OCR, detect patient-boundary pages, validate ranges, export encrypted packets.
-Gemini > Building on Codex, split whenever a new Medical Record Number appears in the header.
-Grok   > Cluster pages by matching patient IDs and queue ambiguous boundaries for review.
-Claude > Page-stream segmentation beats per-page MRN matching; carry the last ID forward...
+  ● grok    ·  4.8s
+  │  A terminal UI feels premium when every keystroke gets an instant, predictable response...
 ```
 
 ## Install (one line)
@@ -32,17 +34,18 @@ Hyperswarm --dangerously-skip-permissions   # same, but every CLI runs with appr
 ### In-session commands
 | command | what it does |
 |---|---|
-| `<question>` | collab round — all four answer in turn, seeing each other |
-| `/parallel <q>` | all four answer at once, independently |
+| `<question>` | **swarm round** — all four answer concurrently, revealed as they finish |
+| `/relay <q>` | reply in turn, each one seeing the previous replies |
 | `/solo <agent> <q>` | ask just one (e.g. `/solo grok ...`) |
-| `/collab` / `/parallel` | switch the default mode |
+| `/swarm` / `/relay` | switch the default mode |
 | `/clear` | wipe shared conversation history |
-| `/help` | show the banner again |
+| `/help` | show the wordmark + commands |
 | `/exit` | quit |
 
 ## How it works
-`hyperswarm.mjs` spawns each CLI headless and pipes a shared transcript between them:
-`claude -p`, `codex exec -o`, `gemini -p` (via its bundled `gemini.js`), `grok --prompt-file`.
+`hyperswarm.mjs` spawns each CLI headless and (in swarm mode) runs them concurrently with a shared
+history: `claude -p`, `codex exec -o`, `gemini -p` (via its bundled `gemini.js`), `grok --prompt-file`.
+The installer embeds the orchestrator as base64 so the Unicode swarm art survives byte-exact.
 With `--dangerously-skip-permissions` it adds each tool's bypass flag
 (`--dangerously-bypass-approvals-and-sandbox`, `--approval-mode yolo`, `--always-approve`,
 `--dangerously-skip-permissions`); otherwise the agents run read-only/guarded.
