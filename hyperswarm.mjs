@@ -4,14 +4,16 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { writeFileSync, readFileSync, mkdtempSync, rmSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { tmpdir, homedir } from 'node:os';
+import { join, dirname, resolve } from 'node:path';
 
 // ---------- flags ----------
 const RAW = (process.argv.slice(2).join(' ') + ' ' + (process.env.HYPERSWARM_ARGS || '')).toLowerCase();
-const SKIP = RAW.includes('--dangerously-skip-permissions') || RAW.includes('--yolo');
+const SAFE = RAW.includes('--safe') || RAW.includes('--no-tools');
+const SKIP = !SAFE;                 // tools ON by default (agents edit files / run commands); --safe = read-only
 const ONCE_IDX = process.argv.indexOf('--once');
 const ONCE = ONCE_IDX !== -1 ? process.argv.slice(ONCE_IDX + 1).join(' ') : null;
+let cwd = process.cwd() || homedir();   // working directory for every agent; change with /cd
 
 // ---------- colors / palette (Nothing dot-matrix x iOS) ----------
 const C = (n) => (s) => `\x1b[${n}m${s}\x1b[0m`;
@@ -110,10 +112,10 @@ const NAMES = AGENTS.map(a => a.name);
 function runAgent(agent, promptText, signal) {
   return new Promise((resolve) => {
     const spec = agent.build(promptText);
-    const child = spawn(spec.cmd, spec.args, { shell: !!spec.shell, windowsHide: true });
+    const child = spawn(spec.cmd, spec.args, { shell: !!spec.shell, windowsHide: true, cwd });
     let out = '', err = '', settled = false;
     const kill = () => { try { child.kill(); } catch {} };
-    const timer = setTimeout(kill, 120000);              // hard backstop
+    const timer = setTimeout(kill, 600000);              // hard backstop (real work can take minutes)
     const onAbort = kill;                                 // straggler cut-off from the round
     if (signal) { if (signal.aborted) kill(); else signal.addEventListener('abort', onAbort, { once: true }); }
     const done = (text, ok) => {
@@ -299,19 +301,22 @@ async function boot() {
 function logo() {
   console.log('');
   console.log('  ' + bold('H Y P E R S W A R M'));
-  console.log('  ' + grey('four minds. one terminal.'));
+  console.log('  ' + grey('an AI engineering team. one terminal.'));
   console.log('  ' + AGENTS.map(a => dotOf(a) + grey(' ' + a.name.toLowerCase())).join('   '));
-  console.log('  ' + grey('permissions: ') + (SKIP ? RED('skipped') : grey('guarded')) + grey('   ·   /help'));
+  console.log('  ' + grey('tools: ') + (SKIP ? GOOD('ON') + grey(' (edits files & runs commands)') : grey('off  (--safe)')));
+  console.log('  ' + grey('dir:   ') + grey(cwd));
+  console.log('  ' + grey('/help for commands'));
   console.log('');
 }
 
 function help() {
   logo();
-  console.log(grey("  it's a group chat - type a message and the swarm chats back,"));
-  console.log(grey('  reacting to you and to each other.'));
-  console.log(grey('  /quick <q>          one fast round, everyone answers once'));
-  console.log(grey('  /solo <agent> <q>   DM just one'));
-  console.log(grey('  /rounds 1-5         reply rounds per message (now ' + rounds + ')'));
+  console.log(grey('  works like a small eng team: discuss together, then assign work.'));
+  console.log(grey('  <message>             talk it through with the team'));
+  console.log(grey('  /solo <agent> <task>  assign to one - they build it (files, commands)'));
+  console.log(grey('  /quick <q>            quick opinion poll, everyone answers once'));
+  console.log(grey('  /cd <path>   /pwd     set / show the working directory'));
+  console.log(grey('  /rounds 1-5           reply rounds per message (now ' + rounds + ')'));
   console.log(grey('  /clear   /help   /exit'));
   console.log('');
 }
@@ -325,16 +330,14 @@ function transcriptText(limit = 26) {
   return history.slice(-limit).map(h => `${h.role === 'User' ? 'You' : h.role}: ${h.text}`).join('\n');
 }
 function chatPrompt(agent) {
-  const others = NAMES.filter(n => n !== agent.name);
   return [
-    `This is a live group chat in a terminal. Members: "You" (the human) and four AIs - ${NAMES.join(', ')}. You are ${agent.name}.`,
-    `Chat like a real group chat: short (1-3 sentences), casual, reactive. Lowercase is fine.`,
-    `Talk WITH the group, not just to the human - agree, disagree, build on a point, or @mention someone (e.g. @${others[0].toLowerCase()}). React to the most recent messages.`,
-    `Never repeat a point already made. If you have nothing worth adding right now, reply with exactly: (pass)`,
-    `This is a text-only chat: do NOT use tools, run commands, browse, or read files - just reply from your own knowledge.`,
-    `No preamble, no sign-off, no "as an AI". Output only your chat message as ${agent.name}.`,
+    `This is a work chat for a small engineering team in a terminal. Members: "You" (the human lead) and four AI engineers - ${NAMES.join(', ')}. You are ${agent.name}.`,
+    `Communicate like a focused, professional coworker: concise and substantive, no small talk, jokes, or filler. Disagreement is fine - back it with reasoning.`,
+    `React to the latest messages: build on a point, flag a risk, or add what's missing. Address a teammate by name when replying to them. Don't repeat what's been said; if you have nothing to add, reply exactly: (pass)`,
+    `You have full tool access - you can read/write files and run commands in the working directory (${cwd}). When the user asks for real work, coordinate: state what you'll take, don't duplicate a teammate's task, prefer one owner per file. For a sizable build, expect the user to hand it to one engineer via /solo.`,
+    `No preamble, no sign-off. Output only your message as ${agent.name}.`,
     ``,
-    `Chat so far:`,
+    `Conversation so far:`,
     transcriptText(),
     ``,
     `${agent.name}:`,
@@ -342,20 +345,20 @@ function chatPrompt(agent) {
 }
 function soloPrompt(agent, user) {
   return [
-    `You are ${agent.name}. Answer the user directly and concisely. Speak in first person as ${agent.name}.`,
-    `This is a text-only chat: do NOT use tools, run commands, browse, or read files - just answer from your own knowledge.`,
-    history.length ? `\nRecent conversation (context):\n${histText()}\n` : ``,
-    `\nUser request:\n${user}\n\nYour response:`,
+    `You are ${agent.name}, an AI engineer with full tool access - read/write files and run commands in the working directory: ${cwd}.`,
+    `The human has assigned this task to you. Actually carry it out: create or edit the files and run the commands needed, then briefly report what you did and how to use it.`,
+    history.length ? `\nTeam conversation so far (context):\n${histText()}\n` : ``,
+    `\nTask:\n${user}\n\nGo:`,
   ].join('\n');
 }
 
 function swarmPrompt(agent, user) {
   const others = NAMES.filter(n => n !== agent.name).join(', ');
   return [
-    `You are ${agent.name}, part of a four-AI swarm in a shared terminal (alongside ${others}).`,
-    `All four of you are answering THIS prompt at the same time, so give your own best, distinctive take - don't wait for or defer to the others.`,
-    `This is a text-only chat: do NOT use tools, run commands, browse, or read files - just answer from your own knowledge.`,
-    `Be concise and direct. No preamble, no sign-off. Speak in first person as ${agent.name}.`,
+    `You are ${agent.name}, one of four AI engineers giving a quick take in a shared terminal (alongside ${others}).`,
+    `All four answer at once, so give your own best, distinctive take - don't defer to the others.`,
+    `This is a quick opinion poll: answer from your own knowledge; do NOT run commands or change files here (use /solo for actual work).`,
+    `Be concise and professional. No preamble, no sign-off. Speak in first person as ${agent.name}.`,
     history.length ? `\nRecent conversation (context):\n${histText()}\n` : ``,
     `\nUser request:\n${user}\n\nYour response as ${agent.name}:`,
   ].join('\n');
@@ -400,7 +403,7 @@ async function chatRound(agents) {
         stage.above(chatLines(a, text)); history.push({ role: a.name, text }); posted.push(a.name);
       }
       // once someone has replied, give stragglers a bounded grace then cut them off (prevents a hung agent freezing the round)
-      if (!graceArmed) { graceArmed = true; setTimeout(() => ac.abort(), 35000); }
+      if (!graceArmed) { graceArmed = true; setTimeout(() => ac.abort(), 120000); }
     })
   ));
   clearInterval(anim);
@@ -436,6 +439,13 @@ async function handle(line) {
   if (t === '/exit' || t === '/quit') { cleanup(); process.exit(0); }
   if (t === '/help') { help(); return; }
   if (t === '/clear') { history.length = 0; console.log(grey('  chat cleared.') + '\n'); return; }
+  if (t === '/pwd') { console.log(grey('  ' + cwd) + '\n'); return; }
+  if (t.startsWith('/cd ')) {
+    const np = resolve(cwd, t.slice(4).trim().replace(/^["']|["']$/g, ''));
+    try { if (statSync(np).isDirectory()) { cwd = np; console.log(grey('  dir: ' + cwd) + '\n'); } else console.log(grey('  not a directory: ' + np) + '\n'); }
+    catch { console.log(grey('  no such path: ' + np) + '\n'); }
+    return;
+  }
   if (t.startsWith('/rounds')) {
     const n = parseInt(t.split(/\s+/)[1], 10);
     if (n >= 1 && n <= 5) { rounds = n; console.log(grey(`  chat depth: ${rounds} round(s) per message.`) + '\n'); }

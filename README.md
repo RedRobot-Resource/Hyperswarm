@@ -1,23 +1,23 @@
 # Hyperswarm
 
-Four AI CLIs — **Codex**, **Gemini**, **Grok**, **Claude** — in one terminal **group chat**.
-Type a message and the swarm chats back: they react to you *and to each other* over multiple rounds,
-`@mention`, agree, push back, or stay quiet — rendered as a live timeline (Nothing × iOS vibes).
+Four AI CLIs — **Codex**, **Gemini**, **Grok**, **Claude** — as one **AI engineering team** in your
+terminal. Discuss a problem with the team, then hand the work to one of them and they actually build it
+— writing files and running commands in your working directory. Rendered as a live timeline with a
+Nothing × iOS thinking panel.
 
 ```
-  ● you  hot take: are microservices overrated for small teams?
+  ● you  should we add caching to the API layer or is it premature?
 
-  ● codex   yeah, usually. for a small team they turn one product problem into
-            five ops problems: deploys, observability, contracts, local dev...
-  ● grok    @codex you'd argue boundaries help long-term but a well-structured
-            monolith + clear modules gets you 90% there with way less ops pain
-  ● gemini  absolutely. what do you think @codex?
-  ● codex   yeah @grok that's where i land too — modular monolith first, split
-            only when a boundary has real pressure.
+  ● claude  Premature unless we have numbers. Caching trades correctness for speed...
+  ● codex   I'd hold off unless we have a concrete repeated-call path or measured latency.
+  ● gemini  Agree it's premature — let's profile the hot endpoints first.
+
+  ● you  /solo codex scaffold a fastify server with a /health route in ./api
+  ● codex  created api/server.js, api/package.json, added a /health route. run: npm i && node server.js
 ```
 
-(Within each round they type concurrently; across rounds they react to each other.
-Claude stayed quiet above — agents can `(pass)` when they've nothing to add.)
+**Tools are ON by default** — agents can read/write files and run commands in the working directory.
+Run with `--safe` for a read-only/guarded session.
 
 ## Install (one line)
 
@@ -31,29 +31,32 @@ Requires Node.js and the four CLIs on PATH (`claude`, `codex`, `gemini`, `grok`)
 ## Use
 
 ```powershell
-Hyperswarm                                  # opens a new terminal window, guarded permissions
-Hyperswarm --dangerously-skip-permissions   # same, but every CLI runs with approvals skipped
+Hyperswarm          # opens a new terminal window; tools ON, starts in your home dir
+Hyperswarm --safe   # read-only/guarded session (no file changes or commands)
 ```
 
 ### In-session commands
 | command | what it does |
 |---|---|
-| `<message>` | **group chat** — the swarm chats with you and each other for `rounds` rounds |
-| `/quick <q>` | one fast round, everyone answers once (live swarm panel + cards) |
-| `/solo <agent> <q>` | DM just one (e.g. `/solo grok ...`) |
-| `/rounds 1-5` | how many reply rounds per message (default 2) |
-| `/clear` | wipe the chat history |
-| `/help` | show the wordmark + commands |
-| `/exit` | quit |
+| `<message>` | **team chat** — discuss with the swarm for `rounds` rounds; they react to each other |
+| `/solo <agent> <task>` | hand the task to one engineer — they build it (writes files, runs commands) |
+| `/quick <q>` | quick opinion poll, everyone answers once (live swarm panel + cards) |
+| `/cd <path>` · `/pwd` | set / show the working directory |
+| `/rounds 1-5` | reply rounds per message (default 2) |
+| `/clear` · `/help` · `/exit` | reset chat · help · quit |
 
 ## How it works
-`hyperswarm.mjs` spawns each CLI headless with a shared chat transcript: `claude -p`, `codex exec -o`,
-`gemini -p` (via its bundled `gemini.js`), `grok --prompt-file`. In group-chat mode each round runs
-the four concurrently, then the next round lets them react to what just landed; an agent replies
-`(pass)` to stay silent, and a fully-silent round ends the exchange. The installer embeds the
+`hyperswarm.mjs` spawns each CLI headless in the working directory with a shared transcript:
+`claude -p`, `codex exec -o`, `gemini -p` (via its bundled `gemini.js`), `grok --prompt-file`. The
+team chat runs the four concurrently per round, then the next round lets them react; an agent replies
+`(pass)` to stay silent, and a fully-silent round ends it. **Discussion is concurrent; building goes
+through `/solo`** so one engineer owns the files (no four-way clobbering). With tools ON each CLI runs
+with its bypass flag (auto-approve), so nothing blocks waiting for a prompt. The installer embeds the
 orchestrator as base64 so the Unicode art survives byte-exact.
 
-> Each message can fan out to up to `rounds × 4` model calls, so a deeper `/rounds` costs more.
+> Tools ON means agents can modify files and run commands in the working dir — use `/cd` to point them
+> at the right project, or `--safe` for a read-only session. Each message fans out to up to `rounds × 4`
+> model calls.
 With `--dangerously-skip-permissions` it adds each tool's bypass flag
 (`--dangerously-bypass-approvals-and-sandbox`, `--approval-mode yolo`, `--always-approve`,
 `--dangerously-skip-permissions`); otherwise the agents run read-only/guarded.
