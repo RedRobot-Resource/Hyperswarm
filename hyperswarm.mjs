@@ -194,6 +194,32 @@ function printCard(res, color) {
   console.log('');
 }
 
+// group-chat line: colored bullet + name label, message flows with hanging indent
+function printChat(agent, text) {
+  const paint = C(agent.color);
+  const label = ('● ' + agent.name.toLowerCase()).padEnd(9);
+  const indent = ' '.repeat(2 + label.length + 1);
+  const lines = wrap(text, Math.min(cols() - indent.length, 88));
+  console.log('  ' + paint(label) + ' ' + (lines[0] || ''));
+  for (const l of lines.slice(1)) console.log(indent + l);
+}
+
+// "x & y are typing..." live indicator (one line, redrawn in place)
+function typingLine(typing, frame) {
+  if (!typing.size) return '';
+  const names = [...typing].map(n => n.toLowerCase());
+  const who = names.length === 1 ? names[0]
+    : names.slice(0, -1).join(', ') + ' & ' + names[names.length - 1];
+  return faint(`  ${who} ${names.length > 1 ? 'are' : 'is'} typing${'.'.repeat((frame % 3) + 1)}`);
+}
+
+// treat "(pass)" / quoted-empty as silence
+function stripPass(t) {
+  const s = String(t || '').trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+  if (!s || /^\(?\s*pass\s*\)?\.?$/i.test(s)) return '';
+  return s;
+}
+
 // single-line spinner for relay / solo
 function miniSpin(a) {
   let i = 0;
@@ -242,10 +268,12 @@ function logo() {
 
 function help() {
   logo();
-  console.log(grey('  ask anything — the swarm replies concurrently.'));
-  console.log(grey('  /relay <q>          reply in turn, each sees the last'));
-  console.log(grey('  /solo <agent> <q>   ask just one'));
-  console.log(grey('  /swarm  /relay      set default mode   ·   /clear  /help  /exit'));
+  console.log(grey("  it's a group chat - type a message and the swarm chats back,"));
+  console.log(grey('  reacting to you and to each other.'));
+  console.log(grey('  /quick <q>          one fast round, everyone answers once'));
+  console.log(grey('  /solo <agent> <q>   DM just one'));
+  console.log(grey('  /rounds 1-5         reply rounds per message (now ' + rounds + ')'));
+  console.log(grey('  /clear   /help   /exit'));
   console.log('');
 }
 
@@ -254,21 +282,22 @@ const history = [];
 function histText() {
   return history.slice(-6).map(h => `${h.role}: ${h.text}`).join('\n\n');
 }
-function collabPrompt(agent, user, transcript) {
-  const others = NAMES.filter(n => n !== agent.name).join(', ');
+function transcriptText(limit = 26) {
+  return history.slice(-limit).map(h => `${h.role === 'User' ? 'You' : h.role}: ${h.text}`).join('\n');
+}
+function chatPrompt(agent) {
+  const others = NAMES.filter(n => n !== agent.name);
   return [
-    `You are ${agent.name}, one of four AI CLIs collaborating live in a shared terminal called Hyperswarm. The others are ${others}.`,
-    `Rules:`,
-    `- Be concise and direct. No preamble, no sign-off.`,
-    `- Speak in first person as ${agent.name}.`,
-    transcript ? `- Teammates already responded below. Build on, correct, or add to them - do NOT repeat what they said.` : `- You are first to respond this round; give a strong useful answer the others can build on.`,
+    `This is a live group chat in a terminal. Members: "You" (the human) and four AIs - ${NAMES.join(', ')}. You are ${agent.name}.`,
+    `Chat like a real group chat: short (1-3 sentences), casual, reactive. Lowercase is fine.`,
+    `Talk WITH the group, not just to the human - agree, disagree, build on a point, or @mention someone (e.g. @${others[0].toLowerCase()}). React to the most recent messages.`,
+    `Never repeat a point already made. If you have nothing worth adding right now, reply with exactly: (pass)`,
+    `No preamble, no sign-off, no "as an AI". Output only your chat message as ${agent.name}.`,
     ``,
-    `User request:`,
-    user,
+    `Chat so far:`,
+    transcriptText(),
     ``,
-    transcript ? `Teammates' responses so far this round:\n${transcript}\n` : ``,
-    history.length ? `Recent conversation (context):\n${histText()}\n` : ``,
-    `Your response as ${agent.name}:`,
+    `${agent.name}:`,
   ].join('\n');
 }
 function soloPrompt(agent, user) {
@@ -311,18 +340,36 @@ async function swarmRound(user) {
     history.push({ role: st.res.name, text: st.res.text });
   }
 }
-// relay: sequential, each sees the prior replies this round
-async function relayRound(user) {
-  history.push({ role: 'User', text: user });
-  let transcript = '';
-  for (const a of AGENTS) {
-    const t0 = Date.now(); hide(); const stop = miniSpin(a);
-    const res = await runAgent(a, collabPrompt(a, user, transcript));
-    stop(); show(); res.dt = Date.now() - t0;
-    printCard(res, a.color);
-    transcript += `${res.name}: ${res.text}\n\n`;
-    history.push({ role: res.name, text: res.text });
+// one chat round: all agents type concurrently, messages drop into the timeline as they land
+async function chatRound(agents) {
+  const typing = new Set(agents.map(a => a.name));
+  let frame = 0;
+  const posted = [];
+  hide();
+  process.stdout.write('\r\x1b[2K' + typingLine(typing, frame));
+  const anim = setInterval(() => { frame++; process.stdout.write('\r\x1b[2K' + typingLine(typing, frame)); }, 300);
+  await Promise.all(agents.map(a =>
+    runAgent(a, chatPrompt(a)).then(res => {
+      typing.delete(a.name);
+      process.stdout.write('\r\x1b[2K');                 // clear the typing line
+      const text = stripPass(res.text);
+      if (text) { printChat(a, text); history.push({ role: a.name, text }); posted.push(a.name); }
+      process.stdout.write(typingLine(typing, frame));    // redraw remaining typers below
+    })
+  ));
+  clearInterval(anim);
+  process.stdout.write('\r\x1b[2K'); show();
+  return posted;
+}
+
+// a full exchange: your message, then up to `rounds` rounds of the swarm chatting with you and each other
+async function converse(userText) {
+  history.push({ role: 'User', text: userText });
+  for (let r = 0; r < rounds; r++) {
+    const posted = await chatRound(AGENTS);
+    if (!posted.length) break;   // everyone passed -> conversation lull, hand it back to you
   }
+  console.log('');
 }
 async function soloRound(name, user) {
   const agent = AGENTS.find(a => a.name.toLowerCase() === name.toLowerCase());
@@ -336,31 +383,34 @@ async function soloRound(name, user) {
 }
 
 // ---------- main loop ----------
-let mode = 'swarm';
+let rounds = 2;   // reply rounds per message
 async function handle(line) {
   const t = line.trim();
   if (!t) return;
   if (t === '/exit' || t === '/quit') { cleanup(); process.exit(0); }
   if (t === '/help') { help(); return; }
-  if (t === '/clear') { history.length = 0; console.log(grey('  history cleared.') + '\n'); return; }
-  if (t === '/swarm') { mode = 'swarm'; console.log(grey('  mode: swarm - all reply at once.') + '\n'); return; }
-  if (t === '/relay') { mode = 'relay'; console.log(grey('  mode: relay - reply in turn, each sees the last.') + '\n'); return; }
-  if (t.startsWith('/swarm ')) { await swarmRound(t.slice(7).trim()); return; }
-  if (t.startsWith('/relay ')) { await relayRound(t.slice(7).trim()); return; }
+  if (t === '/clear') { history.length = 0; console.log(grey('  chat cleared.') + '\n'); return; }
+  if (t.startsWith('/rounds')) {
+    const n = parseInt(t.split(/\s+/)[1], 10);
+    if (n >= 1 && n <= 5) { rounds = n; console.log(grey(`  chat depth: ${rounds} round(s) per message.`) + '\n'); }
+    else console.log(grey('  usage: /rounds 1-5') + '\n');
+    return;
+  }
+  if (t.startsWith('/quick ')) { await swarmRound(t.slice(7).trim()); return; }
   if (t.startsWith('/solo ')) {
     const rest = t.slice(6).trim(); const sp = rest.indexOf(' ');
-    if (sp === -1) { console.log(grey(`  usage: /solo <agent> <question>`) + '\n'); return; }
+    if (sp === -1) { console.log(grey(`  usage: /solo <agent> <message>`) + '\n'); return; }
     await soloRound(rest.slice(0, sp), rest.slice(sp + 1)); return;
   }
-  if (mode === 'relay') await relayRound(t); else await swarmRound(t);
+  await converse(t);
 }
 
 function cleanup() { show(); try { rmSync(TMP, { recursive: true, force: true }); } catch {} }
 
 async function main() {
-  if (ONCE) { await boot(); await swarmRound(ONCE); cleanup(); process.exit(0); }
+  if (ONCE) { await boot(); await converse(ONCE); cleanup(); process.exit(0); }
   await boot();
-  const rl = createInterface({ input: process.stdin, output: process.stdout, prompt: RED('  ● ') });
+  const rl = createInterface({ input: process.stdin, output: process.stdout, prompt: RED('  ● ') + grey('you  ') });
   rl.prompt();
   rl.on('line', async (line) => { await handle(line); rl.prompt(); });
   rl.on('close', () => { cleanup(); process.exit(0); });
