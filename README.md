@@ -35,15 +35,29 @@ Hyperswarm          # opens a new terminal window; tools ON, starts in your home
 Hyperswarm --safe   # read-only/guarded session (no file changes or commands)
 ```
 
+### First run / setup
+On a new computer Hyperswarm shows a **setup screen** that detects each CLI and pings it to verify it's
+authorized, with a login hint for any that aren't. Re-run anytime with `/setup`. Authorization results
+are remembered in `~/.hyperswarm/config.json` (along with your theme, rounds, and disabled agents).
+
 ### In-session commands
 | command | what it does |
 |---|---|
-| `<message>` | **team chat** — discuss with the swarm for `rounds` rounds; they react to each other |
+| `<message>` | **team chat** — discuss with the team for `rounds` rounds; they react to each other |
+| `@<agent> <msg>` | direct a message to one engineer |
 | `/solo <agent> <task>` | hand the task to one engineer — they build it (writes files, runs commands) |
-| `/quick <q>` | quick opinion poll, everyone answers once (live swarm panel + cards) |
+| `/build <task>` | team plans the approach, then one engineer implements it |
+| `/skill <name> [args]` | run a skill (`review`, `test`, `scaffold`, `fix`, `commit`, …) · `/skills` to list |
+| `/skill-add <name> <tmpl>` | save your own skill (use `{args}`) |
+| `/quick <q>` | quick opinion poll, everyone answers once (live swarm panel) |
+| `/agents` · `/agent on\|off <name>` | roster: who's in the room |
+| `/setup` · `/status` | re-authorize · show dir/tools/theme/agents |
+| `/theme <name>` | `aurora` · `mono` · `neon` · `ember` |
 | `/cd <path>` · `/pwd` | set / show the working directory |
-| `/rounds 1-5` | reply rounds per message (default 2) |
+| `/rounds 1-5` · `/save [file]` · `/retry` | chat depth · export transcript · re-run last message |
 | `/clear` · `/help` · `/exit` | reset chat · help · quit |
+
+Tab-completes commands, agent names, skills, and themes.
 
 ## How it works
 `hyperswarm.mjs` spawns each CLI headless in the working directory with a shared transcript:

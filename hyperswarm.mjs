@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// Hyperswarm - 4 AI CLIs (Codex, Gemini, Grok, Claude) collaborating in one terminal.
-// They see each other's answers and reply by name, color-coded. They can also work solo/parallel.
+// Hyperswarm - an AI engineering team (Codex, Gemini, Grok, Claude) in one terminal.
+// Discuss with the team, then hand work to one engineer who actually builds it (files + commands).
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { writeFileSync, readFileSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdtempSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 
@@ -13,16 +13,35 @@ const SAFE = RAW.includes('--safe') || RAW.includes('--no-tools');
 const SKIP = !SAFE;                 // tools ON by default (agents edit files / run commands); --safe = read-only
 const ONCE_IDX = process.argv.indexOf('--once');
 const ONCE = ONCE_IDX !== -1 ? process.argv.slice(ONCE_IDX + 1).join(' ') : null;
-let cwd = process.cwd() || homedir();   // working directory for every agent; change with /cd
+let cwd = process.cwd() || homedir();
 
-// ---------- colors / palette (Nothing dot-matrix x iOS) ----------
+// ---------- Phase 2: persistent config (~/.hyperswarm/config.json) ----------
+const CFG_DIR = join(homedir(), '.hyperswarm');
+const CFG_FILE = join(CFG_DIR, 'config.json');
+const config = { setupDone: false, rounds: 2, theme: 'aurora', disabled: [], skills: {}, lastCwd: null };
+function loadConfig() { try { Object.assign(config, JSON.parse(readFileSync(CFG_FILE, 'utf8'))); } catch {} }
+function saveConfig() { try { mkdirSync(CFG_DIR, { recursive: true }); config.lastCwd = cwd; writeFileSync(CFG_FILE, JSON.stringify(config, null, 2)); } catch {} }
+loadConfig();
+if (config.lastCwd) { try { if (statSync(config.lastCwd).isDirectory()) cwd = config.lastCwd; } catch {} }
+let rounds = Math.min(5, Math.max(1, config.rounds || 2));
+const authState = {};   // name -> { ok, dt }
+if (config.auth) Object.assign(authState, config.auth);   // remember last authorization across sessions
+
+// ---------- Phase 9: themes + color helpers ----------
 const C = (n) => (s) => `\x1b[${n}m${s}\x1b[0m`;
 const bold = (s) => `\x1b[1m${s}\x1b[0m`;
-const dim = C('90');
-const grey = C('38;5;245');       // iOS secondary label
-const faint = C('38;5;240');      // hairline
-const RED = C('38;5;196');        // Nothing signature
-const GOOD = C('38;5;78');        // soft green
+const dim = C('90'), grey = C('38;5;245'), faint = C('38;5;240'), GOOD = C('38;5;78');
+const THEMES = {
+  aurora: { codex: '36',         gemini: '94',         grok: '32',         claude: '38;5;208', accent: '38;5;196' },
+  mono:   { codex: '38;5;252',   gemini: '38;5;246',   grok: '38;5;255',   claude: '38;5;240', accent: '38;5;160' },
+  neon:   { codex: '38;5;51',    gemini: '38;5;201',   grok: '38;5;46',    claude: '38;5;214', accent: '38;5;201' },
+  ember:  { codex: '38;5;214',   gemini: '38;5;203',   grok: '38;5;179',   claude: '38;5;167', accent: '38;5;202' },
+};
+const pal = () => THEMES[config.theme] || THEMES.aurora;
+const aColor = (a) => pal()[a.key];
+const accent = (s) => C(pal().accent)(s);
+
+// ---------- base helpers ----------
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const cols = () => process.stdout.columns || 80;
 const hide = () => process.stdout.write('\x1b[?25l');
@@ -40,6 +59,19 @@ function wrap(text, width) {
   }
   return out;
 }
+function clean(s) { return (s || '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\r/g, '').trim(); }
+function usableErr(err) {
+  return clean(err).split('\n').filter(l => l.trim() &&
+    !/^Warning:/i.test(l) && !/256-color/i.test(l) && !/Ripgrep is not available/i.test(l) &&
+    !/Falling back to/i.test(l) && !/DeprecationWarning|ExperimentalWarning|\(node:|--trace-/i.test(l)
+  ).join('\n').trim();
+}
+function stripPass(t) {
+  const s = String(t || '').trim().replace(/^["'`]+|["'`]+$/g, '').trim();
+  if (!s || /^\(?\s*pass\s*\)?\.?$/i.test(s)) return '';
+  return s;
+}
+const isBad = (t) => /^\((no response|failed to launch)/.test(t || '');
 const TMP = mkdtempSync(join(tmpdir(), 'hyperswarm-'));
 
 // ---------- resolve CLIs on PATH (no shell, so prompts never get re-parsed) ----------
@@ -47,86 +79,64 @@ function which(name) {
   const exts = ['', ...(process.env.PATHEXT || '.EXE;.CMD;.BAT').split(';')];
   for (const dir of (process.env.PATH || '').split(';')) {
     if (!dir) continue;
-    for (const ext of exts) {
-      const p = join(dir, name + ext);
-      try { if (statSync(p).isFile()) return p; } catch {}
-    }
+    for (const ext of exts) { const p = join(dir, name + ext); try { if (statSync(p).isFile()) return p; } catch {} }
   }
   return null;
 }
 const NODE = process.execPath;
 function geminiEntry() {
   const shim = which('gemini');
-  if (shim) {
-    const js = join(dirname(shim), 'node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js');
-    try { if (statSync(js).isFile()) return js; } catch {}
-  }
+  if (shim) { const js = join(dirname(shim), 'node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js'); try { if (statSync(js).isFile()) return js; } catch {} }
   return null;
 }
 const PATHS = { codex: which('codex'), claude: which('claude'), grok: which('grok'), geminiJs: geminiEntry(), gemini: which('gemini') };
 
-// ---------- agent definitions ----------
-// build(promptText) -> { cmd, args, stdin, outFile, shell } for spawning.
+// ---------- agents ----------
 const AGENTS = [
-  {
-    name: 'Codex',  color: '36', // cyan
+  { name: 'Codex', key: 'codex',
     build: (txt) => {
       const out = join(TMP, 'codex-out.txt');
       const args = ['exec', '--skip-git-repo-check', '--color', 'never', '-o', out];
-      if (SKIP) args.push('--dangerously-bypass-approvals-and-sandbox');
-      else args.push('-s', 'read-only');
+      if (SKIP) args.push('--dangerously-bypass-approvals-and-sandbox'); else args.push('-s', 'read-only');
       return { cmd: PATHS.codex || 'codex', args, stdin: txt, outFile: out, shell: !PATHS.codex };
-    },
-  },
-  {
-    name: 'Gemini', color: '94', // bright blue
+    } },
+  { name: 'Gemini', key: 'gemini',
     build: (txt) => {
-      // Gemini rejects -p combined with stdin, so pass the whole prompt as the -p value (no shell = no quoting issues).
       const tail = ['-p', txt, '-o', 'text', '--approval-mode', SKIP ? 'yolo' : 'default'];
       if (PATHS.geminiJs) return { cmd: NODE, args: [PATHS.geminiJs, ...tail], stdin: null, shell: false };
       return { cmd: PATHS.gemini || 'gemini', args: tail, stdin: null, shell: true };
-    },
-  },
-  {
-    name: 'Grok',   color: '32', // green
+    } },
+  { name: 'Grok', key: 'grok',
     build: (txt) => {
-      const pf = join(TMP, 'grok-in.txt');
-      writeFileSync(pf, txt, 'utf8');
-      const args = ['--prompt-file', pf];
-      if (SKIP) args.push('--always-approve');
+      const pf = join(TMP, 'grok-in.txt'); writeFileSync(pf, txt, 'utf8');
+      const args = ['--prompt-file', pf]; if (SKIP) args.push('--always-approve');
       return { cmd: PATHS.grok || 'grok', args, stdin: null, shell: !PATHS.grok };
-    },
-  },
-  {
-    name: 'Claude', color: '38;5;208', // orange
+    } },
+  { name: 'Claude', key: 'claude',
     build: (txt) => {
-      const args = ['-p', '--output-format', 'text'];
-      if (SKIP) args.push('--dangerously-skip-permissions');
+      const args = ['-p', '--output-format', 'text']; if (SKIP) args.push('--dangerously-skip-permissions');
       return { cmd: PATHS.claude || 'claude', args, stdin: txt, shell: !PATHS.claude };
-    },
-  },
+    } },
 ];
 const NAMES = AGENTS.map(a => a.name);
+const findAgent = (n) => AGENTS.find(a => a.name.toLowerCase() === String(n).toLowerCase());
+const installed = (a) => a.key === 'gemini' ? !!(PATHS.geminiJs || PATHS.gemini) : !!PATHS[a.key];
+const activeAgents = () => AGENTS.filter(a => !config.disabled.includes(a.name) && installed(a) && authState[a.name]?.ok !== false);
 
 // ---------- spawn one agent ----------
-function runAgent(agent, promptText, signal) {
-  return new Promise((resolve) => {
+function runAgent(agent, promptText, signal, timeout = 600000) {
+  return new Promise((resolve2) => {
     const spec = agent.build(promptText);
     const child = spawn(spec.cmd, spec.args, { shell: !!spec.shell, windowsHide: true, cwd });
     let out = '', err = '', settled = false;
     const kill = () => { try { child.kill(); } catch {} };
-    const timer = setTimeout(kill, 600000);              // hard backstop (real work can take minutes)
-    const onAbort = kill;                                 // straggler cut-off from the round
+    const timer = setTimeout(kill, timeout);
+    const onAbort = kill;
     if (signal) { if (signal.aborted) kill(); else signal.addEventListener('abort', onAbort, { once: true }); }
-    const done = (text, ok) => {
-      if (settled) return; settled = true;
-      clearTimeout(timer); if (signal) try { signal.removeEventListener('abort', onAbort); } catch {}
-      resolve({ name: agent.name, text, ok });
-    };
+    const done = (text, ok) => { if (settled) return; settled = true; clearTimeout(timer); if (signal) try { signal.removeEventListener('abort', onAbort); } catch {} resolve2({ name: agent.name, text, ok }); };
     child.stdout.on('data', d => out += d);
     child.stderr.on('data', d => err += d);
-    if (spec.stdin != null) { try { child.stdin.write(spec.stdin); child.stdin.end(); } catch {} }
-    else { try { child.stdin.end(); } catch {} }
+    if (spec.stdin != null) { try { child.stdin.write(spec.stdin); child.stdin.end(); } catch {} } else { try { child.stdin.end(); } catch {} }
     child.on('error', e => done(`(failed to launch: ${e.message})`, false));
     child.on('close', () => {
       let text = out;
@@ -137,62 +147,45 @@ function runAgent(agent, promptText, signal) {
     });
   });
 }
-
-function clean(s) {
-  return (s || '')
-    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')   // strip ANSI color codes
-    .replace(/\r/g, '')
-    .trim();
-}
-
-// stderr is only a fallback when stdout is empty; drop harmless CLI warnings so they never post as a message
-function usableErr(err) {
-  return clean(err).split('\n').filter(l => l.trim() &&
-    !/^Warning:/i.test(l) && !/256-color/i.test(l) && !/Ripgrep is not available/i.test(l) &&
-    !/Falling back to/i.test(l) && !/DeprecationWarning|ExperimentalWarning|\(node:|--trace-/i.test(l)
-  ).join('\n').trim();
+// Phase 10: ask = runAgent + one auto-retry on empty/failed, with timing
+async function ask(agent, prompt, opts = {}) {
+  const { signal, timeout = 600000, retry = true } = opts;
+  const t0 = Date.now();
+  let res = await runAgent(agent, prompt, signal, timeout);
+  if (retry && !(signal && signal.aborted) && isBad(res.text)) res = await runAgent(agent, prompt, signal, timeout);
+  res.dt = Date.now() - t0;
+  if (!isBad(res.text)) authState[agent.name] = { ok: true, dt: res.dt };
+  return res;
 }
 
 // ---------- swarm UI ----------
-const dotOf = (a) => C(a.color)('●');                 // colored bullet
-const BRAILLE = '⠁⠂⠄⡀⢀⠠⠐⠈'.split(''); // buzzing particle
+const dotOf = (a) => C(aColor(a))('●');
+const BRAILLE = '⠁⠂⠄⡀⢀⠠⠐⠈'.split('');
 const SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'.split('');
-
-// shimmering swarm field: dots flicker, the brightest carry an agent's color
 function shimmer(width, frame) {
   let s = '';
   for (let i = 0; i < width; i++) {
-    const v = (Math.sin(frame * 0.35 + i * 0.5) + Math.sin(frame * 0.13 + i * 1.7)) / 2;
-    const n = (v + 1) / 2;
-    if (n > 0.86) s += C(AGENTS[(i + frame) % AGENTS.length].color)('●');
-    else if (n > 0.62) s += grey('•');
-    else if (n > 0.42) s += faint('·');
-    else s += ' ';
+    const v = (Math.sin(frame * 0.35 + i * 0.5) + Math.sin(frame * 0.13 + i * 1.7)) / 2, n = (v + 1) / 2;
+    if (n > 0.86) s += C(aColor(AGENTS[(i + frame) % AGENTS.length]))('●');
+    else if (n > 0.62) s += grey('•'); else if (n > 0.42) s += faint('·'); else s += ' ';
   }
   return s;
 }
-
 function agentRow(st, frame) {
-  const a = st.agent, paint = C(a.color);
+  const a = st.agent, paint = C(aColor(a));
   const name = paint(a.name.toLowerCase().padEnd(7));
   const t = (((st.dt || (Date.now() - st.t0)) / 1000).toFixed(1) + 's').padStart(5);
-  if (st.status === 'done') {
-    return `  ${dotOf(a)} ${name}  ${paint('▰▰▰▰▰▰▰▰')}  ${GOOD('ready ✓')}  ${grey(t)}`;
-  }
+  if (st.status === 'done') return `  ${dotOf(a)} ${name}  ${paint('▰▰▰▰▰▰▰▰')}  ${GOOD('ready ✓')}  ${grey(t)}`;
   const trail = Array.from({ length: 8 }, (_, i) => BRAILLE[(frame + i * 2) % BRAILLE.length]).join('');
   return `  ${dotOf(a)} ${name}  ${paint(trail)}  ${grey('swarming')}  ${grey(t)}`;
 }
-
-// live panel that updates in place while all agents work concurrently
 function livePanel(states) {
-  const PH = states.length + 4; // header, blank, rows..., blank, footer
-  let first = true, frame = 0;
+  const PH = states.length + 4; let first = true, frame = 0;
   function draw(finalize = false) {
-    const f = frame++;
-    const done = states.filter(s => s.status === 'done').length;
+    const f = frame++; const done = states.filter(s => s.status === 'done').length;
     const foot = finalize && done === states.length
-      ? `  ${faint('─'.repeat(10))} ${grey(`swarm settled · ${done}/${states.length} replied`)}`
-      : `  ${grey('swarming ' + states.length + ' minds')}${grey('.'.repeat(f % 4))}`;
+      ? `  ${faint('─'.repeat(10))} ${grey(`settled · ${done}/${states.length} replied`)}`
+      : `  ${grey('working ' + states.length)}${grey('.'.repeat(f % 4))}`;
     const lines = [`  ${shimmer(30, f)}`, '', ...states.map(s => agentRow(s, f)), '', foot];
     if (!first) process.stdout.write(`\x1b[${PH}A`);
     for (const l of lines) process.stdout.write('\x1b[2K' + l + '\n');
@@ -200,8 +193,6 @@ function livePanel(states) {
   }
   return { draw };
 }
-
-// iOS-clean answer card: colored bullet + name, hairline rule, wrapped body
 function printCard(res, color) {
   const paint = C(color), bar = paint('│');
   const w = Math.min(cols() - 6, 96);
@@ -210,30 +201,23 @@ function printCard(res, color) {
   for (const l of wrap(res.text, w)) console.log(`  ${bar}  ${l}`);
   console.log('');
 }
-
-// group-chat message as lines: colored bullet + name label, body with hanging indent
 function chatLines(agent, text) {
-  const paint = C(agent.color);
+  const paint = C(aColor(agent));
   const label = ('● ' + agent.name.toLowerCase()).padEnd(9);
   const indent = ' '.repeat(2 + label.length + 1);
   const wrapped = wrap(text, Math.min(cols() - indent.length, 88));
   const out = ['  ' + paint(label) + ' ' + (wrapped[0] || '')];
   for (const l of wrapped.slice(1)) out.push(indent + l);
-  out.push('');                 // breathing room between messages
+  out.push('');
   return out;
 }
-
-// per-agent buzzing glyphs (Nothing-style) for whoever is still typing
 function typingGlyphs(typing, frame) {
   const parts = AGENTS.filter(a => typing.has(a.name)).map(a => {
     const tr = Array.from({ length: 4 }, (_, i) => BRAILLE[(frame + i * 2 + a.name.length) % BRAILLE.length]).join('');
-    return `${dotOf(a)} ${C(a.color)(a.name.toLowerCase())} ${C(a.color)(tr)}`;
+    return `${dotOf(a)} ${C(aColor(a))(a.name.toLowerCase())} ${C(aColor(a))(tr)}`;
   });
   return parts.length ? '  ' + parts.join('   ') : '';
 }
-
-// sticky bottom "thinking" panel: shimmer dot-field + buzzing agent glyphs + hairline,
-// while chat messages are printed ABOVE it via .above()
 function thinkingStage(getTyping) {
   const W = Math.min((cols() || 80) - 4, 44), H = 3;
   let drawn = false, frame = 0;
@@ -247,100 +231,71 @@ function thinkingStage(getTyping) {
   }
   function draw() { if (drawn) w(`\x1b[${H}A`); w('\x1b[0J'); w(lines().join('\n') + '\n'); drawn = true; }
   return {
-    start() { hide(); draw(); },
-    tick() { frame++; draw(); },
+    start() { hide(); draw(); }, tick() { frame++; draw(); },
     above(ls) { if (drawn) { w(`\x1b[${H}A`); drawn = false; } w('\x1b[0J'); for (const x of ls) w(x + '\n'); draw(); },
     stop() { if (drawn) { w(`\x1b[${H}A`); drawn = false; } w('\x1b[0J'); show(); },
   };
 }
-
-// treat "(pass)" / quoted-empty as silence
-function stripPass(t) {
-  const s = String(t || '').trim().replace(/^["'`]+|["'`]+$/g, '').trim();
-  if (!s || /^\(?\s*pass\s*\)?\.?$/i.test(s)) return '';
-  return s;
-}
-
-// single-line spinner for relay / solo
 function miniSpin(a) {
   let i = 0;
-  const id = setInterval(() => {
-    process.stdout.write(`\r  ${dotOf(a)} ${grey(a.name.toLowerCase() + ' ' + SPIN[i++ % SPIN.length] + ' thinking')}   `);
-  }, 90);
+  const id = setInterval(() => process.stdout.write(`\r  ${dotOf(a)} ${grey(a.name.toLowerCase() + ' ' + SPIN[i++ % SPIN.length] + ' working')}   `), 90);
   return () => { clearInterval(id); process.stdout.write('\r\x1b[2K'); };
 }
-
-// boot: a swarm of particles converges, then the dot-matrix wordmark settles in
 async function boot() {
   if (ONCE) { logo(); return; }
   hide();
   const W = 38, H = 5, N = 46;
-  const P = Array.from({ length: N }, () => ({
-    sx: Math.random() * W, sy: Math.random() * H,
-    tx: W / 2 + (Math.random() - 0.5) * W * 0.92, ty: Math.random() * H,
-    c: AGENTS[Math.floor(Math.random() * AGENTS.length)].color,
-  }));
+  const P = Array.from({ length: N }, () => ({ sx: Math.random() * W, sy: Math.random() * H, tx: W / 2 + (Math.random() - 0.5) * W * 0.92, ty: Math.random() * H, c: aColor(AGENTS[Math.floor(Math.random() * AGENTS.length)]) }));
   const F = 16;
   for (let f = 0; f <= F; f++) {
-    const p = f / F, e = p * p * (3 - 2 * p); // smoothstep
+    const p = f / F, e = p * p * (3 - 2 * p);
     const grid = Array.from({ length: H }, () => Array(W).fill(null));
-    for (const pt of P) {
-      const x = Math.round(pt.sx + (pt.tx - pt.sx) * e);
-      const y = Math.round(pt.sy + (pt.ty - pt.sy) * e);
-      if (x >= 0 && x < W && y >= 0 && y < H) grid[y][x] = { ch: f < F ? '·•●'[Math.min(2, Math.floor(p * 3))] : '●', c: pt.c };
-    }
+    for (const pt of P) { const x = Math.round(pt.sx + (pt.tx - pt.sx) * e), y = Math.round(pt.sy + (pt.ty - pt.sy) * e); if (x >= 0 && x < W && y >= 0 && y < H) grid[y][x] = { ch: f < F ? '·•●'[Math.min(2, Math.floor(p * 3))] : '●', c: pt.c }; }
     const lines = grid.map(row => '  ' + row.map(c => c ? C(c.c)(c.ch) : ' ').join(''));
     if (f) process.stdout.write(`\x1b[${H}A`);
     for (const l of lines) process.stdout.write('\x1b[2K' + l + '\n');
     await sleep(48);
   }
-  show();
-  logo();
+  show(); logo();
 }
-
 function logo() {
   console.log('');
   console.log('  ' + bold('H Y P E R S W A R M'));
   console.log('  ' + grey('an AI engineering team. one terminal.'));
   console.log('  ' + AGENTS.map(a => dotOf(a) + grey(' ' + a.name.toLowerCase())).join('   '));
-  console.log('  ' + grey('tools: ') + (SKIP ? GOOD('ON') + grey(' (edits files & runs commands)') : grey('off  (--safe)')));
+  console.log('  ' + grey('tools: ') + (SKIP ? GOOD('ON') + grey(' (edits files & runs commands)') : grey('off  (--safe)')) + grey('   theme: ' + config.theme));
   console.log('  ' + grey('dir:   ') + grey(cwd));
   console.log('  ' + grey('/help for commands'));
   console.log('');
 }
-
 function help() {
   logo();
-  console.log(grey('  works like a small eng team: discuss together, then assign work.'));
+  console.log(grey('  works like a small eng team: discuss, then assign the work.'));
   console.log(grey('  <message>             talk it through with the team'));
+  console.log(grey('  @<agent> <message>    direct it to one engineer'));
   console.log(grey('  /solo <agent> <task>  assign to one - they build it (files, commands)'));
+  console.log(grey('  /build <task>         team plans, then one engineer implements'));
+  console.log(grey('  /skill <name> [args]  run a skill   ·   /skills to list'));
   console.log(grey('  /quick <q>            quick opinion poll, everyone answers once'));
-  console.log(grey('  /cd <path>   /pwd     set / show the working directory'));
-  console.log(grey('  /rounds 1-5           reply rounds per message (now ' + rounds + ')'));
-  console.log(grey('  /clear   /help   /exit'));
+  console.log(grey('  /agents  /agent on|off <name>   /status   /setup'));
+  console.log(grey('  /cd <path>  /pwd   /theme <name>   /rounds 1-5   /save [file]'));
+  console.log(grey('  /retry   /clear   /help   /exit'));
   console.log('');
 }
 
 // ---------- prompts ----------
 const history = [];
-function histText() {
-  return history.slice(-6).map(h => `${h.role}: ${h.text}`).join('\n\n');
-}
-function transcriptText(limit = 26) {
-  return history.slice(-limit).map(h => `${h.role === 'User' ? 'You' : h.role}: ${h.text}`).join('\n');
-}
+let lastUser = null;
+const histText = () => history.slice(-6).map(h => `${h.role}: ${h.text}`).join('\n\n');
+const transcriptText = (limit = 26) => history.slice(-limit).map(h => `${h.role === 'User' ? 'You' : h.role}: ${h.text}`).join('\n');
 function chatPrompt(agent) {
   return [
     `This is a work chat for a small engineering team in a terminal. Members: "You" (the human lead) and four AI engineers - ${NAMES.join(', ')}. You are ${agent.name}.`,
     `Communicate like a focused, professional coworker: concise and substantive, no small talk, jokes, or filler. Disagreement is fine - back it with reasoning.`,
     `React to the latest messages: build on a point, flag a risk, or add what's missing. Address a teammate by name when replying to them. Don't repeat what's been said; if you have nothing to add, reply exactly: (pass)`,
-    `You have full tool access - you can read/write files and run commands in the working directory (${cwd}). When the user asks for real work, coordinate: state what you'll take, don't duplicate a teammate's task, prefer one owner per file. For a sizable build, expect the user to hand it to one engineer via /solo.`,
+    `You have full tool access - read/write files and run commands in the working directory (${cwd}). When the user asks for real work, coordinate: state what you'll take, don't duplicate a teammate's task, prefer one owner per file. For a sizable build, expect the user to hand it to one engineer via /solo or /build.`,
     `No preamble, no sign-off. Output only your message as ${agent.name}.`,
-    ``,
-    `Conversation so far:`,
-    transcriptText(),
-    ``,
-    `${agent.name}:`,
+    ``, `Conversation so far:`, transcriptText(), ``, `${agent.name}:`,
   ].join('\n');
 }
 function soloPrompt(agent, user) {
@@ -351,7 +306,6 @@ function soloPrompt(agent, user) {
     `\nTask:\n${user}\n\nGo:`,
   ].join('\n');
 }
-
 function swarmPrompt(agent, user) {
   const others = NAMES.filter(n => n !== agent.name).join(', ');
   return [
@@ -365,111 +319,228 @@ function swarmPrompt(agent, user) {
 }
 
 // ---------- rounds ----------
-// swarm: all four run concurrently; answers revealed in the order they FINISH (not a fixed order)
 async function swarmRound(user) {
+  const agents = activeAgents();
+  if (!agents.length) return noEngineers();
   history.push({ role: 'User', text: user });
-  const states = AGENTS.map(a => ({ agent: a, status: 'thinking', t0: Date.now(), dt: 0, res: null, order: 0 }));
-  const panel = livePanel(states);
-  hide(); panel.draw();
-  const anim = setInterval(() => panel.draw(), 80);
-  let order = 0;
-  await Promise.all(states.map(st =>
-    runAgent(st.agent, swarmPrompt(st.agent, user)).then(res => {
-      st.status = 'done'; st.dt = Date.now() - st.t0; st.res = { ...res, dt: st.dt }; st.order = ++order;
-    })
-  ));
-  clearInterval(anim); panel.draw(true); show();
-  console.log('');
-  for (const st of [...states].sort((a, b) => a.order - b.order)) {
-    printCard(st.res, st.agent.color);
-    history.push({ role: st.res.name, text: st.res.text });
-  }
+  const states = agents.map(a => ({ agent: a, status: 'thinking', t0: Date.now(), dt: 0, res: null, order: 0 }));
+  const panel = livePanel(states); hide(); panel.draw();
+  const anim = setInterval(() => panel.draw(), 80); let order = 0;
+  await Promise.all(states.map(st => ask(st.agent, swarmPrompt(st.agent, user)).then(res => { st.status = 'done'; st.dt = Date.now() - st.t0; st.res = { ...res, dt: st.dt }; st.order = ++order; })));
+  clearInterval(anim); panel.draw(true); show(); console.log('');
+  for (const st of [...states].sort((a, b) => a.order - b.order)) { printCard(st.res, aColor(st.agent)); history.push({ role: st.res.name, text: st.res.text }); }
 }
-// one chat round: all agents type concurrently under a live Nothing-style thinking panel;
-// each message drops into the timeline above the panel as that agent lands
 async function chatRound(agents) {
-  const typing = new Set(agents.map(a => a.name));
-  const posted = [];
-  const stage = thinkingStage(() => typing);
-  stage.start();
+  const typing = new Set(agents.map(a => a.name)); const posted = [];
+  const stage = thinkingStage(() => typing); stage.start();
   const anim = setInterval(() => stage.tick(), 110);
-  const ac = new AbortController();
-  let graceArmed = false;
-  await Promise.allSettled(agents.map(a =>
-    runAgent(a, chatPrompt(a), ac.signal).then(res => {
-      typing.delete(a.name);
-      const text = stripPass(res.text);
-      if (text && !/^\((no response|failed to launch)/.test(text)) {
-        stage.above(chatLines(a, text)); history.push({ role: a.name, text }); posted.push(a.name);
-      }
-      // once someone has replied, give stragglers a bounded grace then cut them off (prevents a hung agent freezing the round)
-      if (!graceArmed) { graceArmed = true; setTimeout(() => ac.abort(), 120000); }
-    })
-  ));
-  clearInterval(anim);
-  stage.stop();
+  const ac = new AbortController(); let graceArmed = false;
+  await Promise.allSettled(agents.map(a => ask(a, chatPrompt(a), { signal: ac.signal }).then(res => {
+    typing.delete(a.name);
+    const text = stripPass(res.text);
+    if (text && !isBad(text)) { stage.above(chatLines(a, text)); history.push({ role: a.name, text }); posted.push(a.name); }
+    if (!graceArmed) { graceArmed = true; setTimeout(() => ac.abort(), 120000); }
+  })));
+  clearInterval(anim); stage.stop();
   return posted;
 }
-
-// a full exchange: your message, then up to `rounds` rounds of the swarm chatting with you and each other
 async function converse(userText) {
-  history.push({ role: 'User', text: userText });
-  for (let r = 0; r < rounds; r++) {
-    const posted = await chatRound(AGENTS);
-    if (!posted.length) break;   // everyone passed -> conversation lull, hand it back to you
-  }
+  if (!activeAgents().length) return noEngineers();
+  lastUser = userText; history.push({ role: 'User', text: userText });
+  for (let r = 0; r < rounds; r++) { const posted = await chatRound(activeAgents()); if (!posted.length) break; }
   console.log('');
 }
 async function soloRound(name, user) {
-  const agent = AGENTS.find(a => a.name.toLowerCase() === name.toLowerCase());
-  if (!agent) { console.log(grey(`  unknown agent "${name}". try: ${NAMES.map(n => n.toLowerCase()).join(', ')}`) + '\n'); return; }
-  history.push({ role: 'User', text: user });
-  const t0 = Date.now(); hide(); const stop = miniSpin(agent);
-  const res = await runAgent(agent, soloPrompt(agent, user));
-  stop(); show(); res.dt = Date.now() - t0;
-  printCard(res, agent.color);
+  const agent = findAgent(name);
+  if (!agent) { console.log(grey(`  unknown engineer "${name}". try: ${NAMES.map(n => n.toLowerCase()).join(', ')}`) + '\n'); return; }
+  history.push({ role: 'User', text: `(to ${agent.name}) ${user}` });
+  hide(); const stop = miniSpin(agent);
+  const res = await ask(agent, soloPrompt(agent, user), {});
+  stop(); show(); printCard(res, aColor(agent));
   history.push({ role: res.name, text: res.text });
+}
+// Phase 5: team plans, then the best builder implements
+function defaultBuilder() {
+  const en = activeAgents();
+  return en.find(a => a.key === 'codex') || en.find(a => a.key === 'claude') || en[0] || AGENTS[0];
+}
+async function buildTask(task) {
+  if (!activeAgents().length) return noEngineers();
+  console.log(grey('  team is planning the approach...') + '\n');
+  await swarmRound(`Propose how to approach this in 1-2 sentences each, no code yet.\nTask: ${task}`);
+  const b = defaultBuilder();
+  console.log(grey(`  ${b.name.toLowerCase()} is implementing...`) + '\n');
+  await soloRound(b.name, `Implement this task now, using the team's plan above as guidance. Create/edit files and run commands as needed.\nTask: ${task}`);
+}
+function noEngineers() { console.log(grey('  no engineers available - run /setup, or enable one with /agent on <name>.') + '\n'); }
+
+// ---------- Phase 4: skills ----------
+const SKILLS = {
+  review:   { solo: false, desc: 'team reviews code/diff for bugs & fixes', expand: a => `Review ${a || 'the current changes in this directory'} for correctness bugs and concrete improvements. Cite file:line and give the fix.` },
+  explain:  { solo: false, desc: 'explain a file / codebase',              expand: a => `Explain ${a || 'this codebase'} concisely - structure, key files, how it runs.` },
+  plan:     { solo: false, desc: 'break a goal into a build plan',          expand: a => `Break this into a concrete, ordered build plan with owners: ${a}` },
+  scaffold: { solo: true,  desc: 'scaffold a new project/component',        expand: a => `Scaffold ${a}. Create the files and a minimal runnable setup, then report how to run it.` },
+  test:     { solo: true,  desc: 'write & run tests',                       expand: a => `Write tests for ${a || 'the recent code'}. Create the test files and run them; report results.` },
+  refactor: { solo: true,  desc: 'refactor code (behavior-preserving)',     expand: a => `Refactor ${a}. Make the edits, keep behavior identical; summarize what changed.` },
+  fix:      { solo: true,  desc: 'find & fix a bug',                        expand: a => `Find and fix: ${a}. Make the edits and verify it works.` },
+  document: { solo: true,  desc: 'write docs / README',                     expand: a => `Write clear documentation for ${a || 'this project'}. Create/update the README and report.` },
+  commit:   { solo: true,  desc: 'stage & commit changes',                  expand: a => `Stage and commit the current changes with a clear conventional message${a ? ` about: ${a}` : ''}. Run the git commands and show the result.` },
+};
+function listSkills() {
+  console.log('');
+  console.log('  ' + bold('skills') + grey('    /skill <name> [args]'));
+  for (const [k, v] of Object.entries(SKILLS)) console.log('  ' + C(pal().codex)(k.padEnd(10)) + grey(v.desc) + (v.solo ? dim('  (solo)') : ''));
+  const us = Object.keys(config.skills || {});
+  if (us.length) { console.log('  ' + grey('your skills:')); for (const k of us) console.log('  ' + C(pal().grok)(k.padEnd(10)) + grey(config.skills[k])); }
+  console.log('  ' + grey('add your own:  /skill-add <name> <template with {args}>'));
+  console.log('');
+}
+async function runSkill(rest) {
+  const sp = rest.indexOf(' ');
+  const name = (sp === -1 ? rest : rest.slice(0, sp)).toLowerCase();
+  const args = sp === -1 ? '' : rest.slice(sp + 1).trim();
+  let sk = SKILLS[name], task;
+  if (sk) task = sk.expand(args);
+  else if (config.skills[name]) { sk = { solo: true }; task = config.skills[name].replace(/\{args\}/g, args); }
+  else { console.log(grey(`  unknown skill "${name}". /skills to list.`) + '\n'); return; }
+  if (sk.solo) await soloRound(defaultBuilder().name, task); else await converse(task);
+}
+
+// ---------- Phase 1: setup / authorization wizard ----------
+const LOGIN = { Codex: 'codex login', Gemini: 'gemini   (then choose sign-in / paste API key)', Grok: 'grok   (then complete sign-in)', Claude: 'claude   (then /login)' };
+const INSTALL = { Codex: 'npm i -g @openai/codex', Gemini: 'npm i -g @google/gemini-cli', Grok: 'install the grok CLI (xAI)', Claude: 'npm i -g @anthropic-ai/claude-code' };
+async function setupWizard() {
+  console.log('');
+  console.log('  ' + bold('SETUP') + grey('   -   authorize your engineers on this machine'));
+  console.log('');
+  for (const a of AGENTS) console.log('  ' + dotOf(a) + ' ' + C(aColor(a))(a.name.toLowerCase().padEnd(8)) + (installed(a) ? grey('found on PATH') : accent('not installed')));
+  console.log('');
+  let i = 0; hide();
+  const sp = setInterval(() => process.stdout.write(`\r  ${dim(SPIN[i++ % SPIN.length] + ' pinging each engineer to verify authorization...')}   `), 90);
+  await Promise.all(AGENTS.map(async a => {
+    if (!installed(a)) { authState[a.name] = { ok: false }; return; }
+    const res = await ask(a, 'Reply with exactly: ok', { timeout: 45000, retry: false });
+    authState[a.name] = { ok: !isBad(res.text), dt: res.dt };
+  }));
+  clearInterval(sp); process.stdout.write('\r\x1b[2K'); show();
+  console.log('  ' + bold('results') + '\n');
+  for (const a of AGENTS) {
+    const st = authState[a.name] || {};
+    const mark = !installed(a) ? accent('not installed') : st.ok ? GOOD('authorized ✓') : accent('needs login');
+    console.log('  ' + dotOf(a) + ' ' + C(aColor(a))(a.name.toLowerCase().padEnd(8)) + mark + (st.ok && st.dt ? grey('   ' + (st.dt / 1000).toFixed(1) + 's') : ''));
+    if (!st.ok) console.log('      ' + grey('-> ') + grey(installed(a) ? 'authorize:  ' + LOGIN[a.name] : 'install:    ' + INSTALL[a.name]));
+  }
+  config.setupDone = true; config.auth = authState; saveConfig();
+  console.log('');
+  console.log('  ' + grey('authorize in another terminal, then re-run /setup. disable one with /agent off <name>.'));
+  console.log('');
+}
+
+// ---------- Phase 3 + 8: roster / status ----------
+function agentLine(a) {
+  const dis = config.disabled.includes(a.name), st = authState[a.name];
+  const state = dis ? dim('disabled') : !installed(a) ? accent('not installed') : st ? (st.ok ? GOOD('ok') : accent('login?')) : grey('untested');
+  const lat = st && st.dt ? grey('   ' + (st.dt / 1000).toFixed(1) + 's') : '';
+  return '  ' + dotOf(a) + ' ' + C(aColor(a))(a.name.toLowerCase().padEnd(8)) + state + lat;
+}
+function listAgents() {
+  console.log('\n  ' + bold('engineers'));
+  for (const a of AGENTS) console.log(agentLine(a));
+  console.log('  ' + grey('toggle with  /agent on <name>  /  /agent off <name>') + '\n');
+}
+function status() {
+  console.log('\n  ' + bold('status'));
+  console.log('  ' + grey('dir:    ') + grey(cwd));
+  console.log('  ' + grey('tools:  ') + (SKIP ? GOOD('ON') : grey('off (--safe)')) + grey('    theme: ') + grey(config.theme) + grey('    rounds: ') + grey(rounds));
+  for (const a of AGENTS) console.log(agentLine(a));
+  console.log('');
+}
+function setAgent(on, name) {
+  const a = findAgent(name); if (!a) { console.log(grey('  unknown engineer.') + '\n'); return; }
+  config.disabled = config.disabled.filter(n => n !== a.name);
+  if (!on) config.disabled.push(a.name);
+  saveConfig(); console.log(grey(`  ${a.name.toLowerCase()} ${on ? 'enabled' : 'disabled'}.`) + '\n');
+}
+
+// ---------- Phase 7: save transcript ----------
+function saveTranscript(file) {
+  if (!history.length) { console.log(grey('  nothing to save yet.') + '\n'); return; }
+  const p = resolve(cwd, file || 'hyperswarm-chat.md');
+  const md = '# Hyperswarm transcript\n\n' + history.map(h => `**${h.role === 'User' ? 'You' : h.role}:** ${h.text}`).join('\n\n') + '\n';
+  try { writeFileSync(p, md, 'utf8'); console.log(grey('  saved -> ' + p) + '\n'); } catch (e) { console.log(grey('  save failed: ' + e.message) + '\n'); }
+}
+
+// ---------- Phase 6: tab autocomplete ----------
+function completer(line) {
+  const base = ['/help', '/setup', '/status', '/agents', '/agent on ', '/agent off ', '/skills', '/skill ', '/skill-add ', '/quick ', '/solo ', '/build ', '/cd ', '/pwd', '/rounds ', '/theme ', '/save', '/clear', '/retry', '/exit'];
+  const skills = Object.keys({ ...SKILLS, ...config.skills }).map(s => '/skill ' + s + ' ');
+  const ats = NAMES.map(n => '@' + n.toLowerCase() + ' ');
+  const themes = Object.keys(THEMES).map(t => '/theme ' + t);
+  const all = [...base, ...skills, ...ats, ...themes];
+  const hits = all.filter(c => c.startsWith(line));
+  return [hits.length ? hits : [], line];
 }
 
 // ---------- main loop ----------
-let rounds = 2;   // reply rounds per message
 async function handle(line) {
   const t = line.trim();
   if (!t) return;
-  if (t === '/exit' || t === '/quit') { cleanup(); process.exit(0); }
-  if (t === '/help') { help(); return; }
-  if (t === '/clear') { history.length = 0; console.log(grey('  chat cleared.') + '\n'); return; }
+  if (t === '/exit' || t === '/quit') { saveConfig(); cleanup(); process.exit(0); }
+  if (t === '/help') return help();
+  if (t === '/status') return status();
+  if (t === '/setup') return setupWizard();
+  if (t === '/agents') return listAgents();
+  if (t === '/skills') return listSkills();
   if (t === '/pwd') { console.log(grey('  ' + cwd) + '\n'); return; }
-  if (t.startsWith('/cd ')) {
-    const np = resolve(cwd, t.slice(4).trim().replace(/^["']|["']$/g, ''));
-    try { if (statSync(np).isDirectory()) { cwd = np; console.log(grey('  dir: ' + cwd) + '\n'); } else console.log(grey('  not a directory: ' + np) + '\n'); }
-    catch { console.log(grey('  no such path: ' + np) + '\n'); }
+  if (t === '/clear') { history.length = 0; console.log(grey('  chat cleared.') + '\n'); return; }
+  if (t === '/retry') { if (lastUser) await converse(lastUser); else console.log(grey('  nothing to retry.') + '\n'); return; }
+  if (t === '/save' || t.startsWith('/save ')) return saveTranscript(t.length > 5 ? t.slice(6).trim() : '');
+  if (t.startsWith('/agent on ')) return setAgent(true, t.slice(10).trim());
+  if (t.startsWith('/agent off ')) return setAgent(false, t.slice(11).trim());
+  if (t.startsWith('/theme')) {
+    const n = t.split(/\s+/)[1];
+    if (!n) { console.log(grey('  themes: ' + Object.keys(THEMES).join(', ') + '   (now ' + config.theme + ')') + '\n'); return; }
+    if (THEMES[n]) { config.theme = n; saveConfig(); logo(); } else console.log(grey('  unknown theme.') + '\n');
     return;
   }
   if (t.startsWith('/rounds')) {
     const n = parseInt(t.split(/\s+/)[1], 10);
-    if (n >= 1 && n <= 5) { rounds = n; console.log(grey(`  chat depth: ${rounds} round(s) per message.`) + '\n'); }
+    if (n >= 1 && n <= 5) { rounds = n; config.rounds = n; saveConfig(); console.log(grey(`  chat depth: ${rounds} round(s) per message.`) + '\n'); }
     else console.log(grey('  usage: /rounds 1-5') + '\n');
     return;
   }
-  if (t.startsWith('/quick ')) { await swarmRound(t.slice(7).trim()); return; }
-  if (t.startsWith('/solo ')) {
-    const rest = t.slice(6).trim(); const sp = rest.indexOf(' ');
-    if (sp === -1) { console.log(grey(`  usage: /solo <agent> <message>`) + '\n'); return; }
-    await soloRound(rest.slice(0, sp), rest.slice(sp + 1)); return;
+  if (t.startsWith('/cd ')) {
+    const np = resolve(cwd, t.slice(4).trim().replace(/^["']|["']$/g, ''));
+    try { if (statSync(np).isDirectory()) { cwd = np; saveConfig(); console.log(grey('  dir: ' + cwd) + '\n'); } else console.log(grey('  not a directory: ' + np) + '\n'); }
+    catch { console.log(grey('  no such path: ' + np) + '\n'); }
+    return;
   }
+  if (t.startsWith('/skill-add ')) {
+    const r = t.slice(11).trim(), sp = r.indexOf(' ');
+    if (sp === -1) { console.log(grey('  usage: /skill-add <name> <template with {args}>') + '\n'); return; }
+    config.skills[r.slice(0, sp).toLowerCase()] = r.slice(sp + 1); saveConfig(); console.log(grey('  skill saved.') + '\n'); return;
+  }
+  if (t.startsWith('/skill ')) return runSkill(t.slice(7).trim());
+  if (t.startsWith('/quick ')) return swarmRound(t.slice(7).trim());
+  if (t.startsWith('/build ')) return buildTask(t.slice(7).trim());
+  if (t.startsWith('/solo ')) {
+    const rest = t.slice(6).trim(), sp = rest.indexOf(' ');
+    if (sp === -1) { console.log(grey('  usage: /solo <agent> <task>') + '\n'); return; }
+    return soloRound(rest.slice(0, sp), rest.slice(sp + 1));
+  }
+  const at = t.match(/^@(\w+)\s+([\s\S]+)/);
+  if (at && findAgent(at[1])) return soloRound(at[1], at[2]);
   await converse(t);
 }
-
 function cleanup() { show(); try { rmSync(TMP, { recursive: true, force: true }); } catch {} }
-
 async function main() {
   if (ONCE) { await boot(); await converse(ONCE); cleanup(); process.exit(0); }
   await boot();
-  const rl = createInterface({ input: process.stdin, output: process.stdout, prompt: RED('  ● ') + grey('you  ') });
+  if (!config.setupDone) await setupWizard();
+  const rl = createInterface({ input: process.stdin, output: process.stdout, prompt: accent('  ● ') + grey('you  '), completer });
   rl.prompt();
   rl.on('line', async (line) => { await handle(line); rl.prompt(); });
-  rl.on('close', () => { cleanup(); process.exit(0); });
+  rl.on('close', () => { saveConfig(); cleanup(); process.exit(0); });
 }
-process.on('SIGINT', () => { process.stdout.write('\n'); cleanup(); process.exit(0); });
+process.on('SIGINT', () => { process.stdout.write('\n'); saveConfig(); cleanup(); process.exit(0); });
 main();
