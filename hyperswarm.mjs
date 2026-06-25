@@ -18,7 +18,7 @@ let cwd = process.cwd() || homedir();
 // ---------- Phase 2: persistent config (~/.hyperswarm/config.json) ----------
 const CFG_DIR = join(homedir(), '.hyperswarm');
 const CFG_FILE = join(CFG_DIR, 'config.json');
-const config = { setupDone: false, rounds: 2, theme: 'aurora', disabled: [], skills: {}, lastCwd: null };
+const config = { setupDone: false, rounds: 2, theme: 'aurora', disabled: [], skills: {}, lastCwd: null, smart: false, defaultAgent: 'Claude' };
 function loadConfig() { try { Object.assign(config, JSON.parse(readFileSync(CFG_FILE, 'utf8'))); } catch {} }
 function saveConfig() { try { mkdirSync(CFG_DIR, { recursive: true }); config.lastCwd = cwd; writeFileSync(CFG_FILE, JSON.stringify(config, null, 2)); } catch {} }
 loadConfig();
@@ -32,14 +32,15 @@ const C = (n) => (s) => `\x1b[${n}m${s}\x1b[0m`;
 const bold = (s) => `\x1b[1m${s}\x1b[0m`;
 const dim = C('90'), grey = C('38;5;245'), faint = C('38;5;240'), GOOD = C('38;5;78');
 const THEMES = {
-  aurora: { codex: '36',         gemini: '94',         grok: '32',         claude: '38;5;208', accent: '38;5;196' },
-  mono:   { codex: '38;5;252',   gemini: '38;5;246',   grok: '38;5;255',   claude: '38;5;240', accent: '38;5;160' },
-  neon:   { codex: '38;5;51',    gemini: '38;5;201',   grok: '38;5;46',    claude: '38;5;214', accent: '38;5;201' },
-  ember:  { codex: '38;5;214',   gemini: '38;5;203',   grok: '38;5;179',   claude: '38;5;167', accent: '38;5;202' },
+  aurora: { codex: '38;5;44',    gemini: '38;5;111',   grok: '38;5;78',    claude: '38;5;215',  vibe: '38;5;205',  orch: '38;5;141',  accent: '38;5;205' },
+  mono:   { codex: '38;5;252',   gemini: '38;5;246',   grok: '38;5;255',   claude: '38;5;240',  vibe: '38;5;248',  orch: '38;5;250',  accent: '38;5;160' },
+  neon:   { codex: '38;5;51',    gemini: '38;5;201',   grok: '38;5;46',    claude: '38;5;214',  vibe: '38;5;198',  orch: '38;5;99',   accent: '38;5;201' },
+  ember:  { codex: '38;5;214',   gemini: '38;5;203',   grok: '38;5;179',   claude: '38;5;167',  vibe: '38;5;211',  orch: '38;5;222',  accent: '38;5;202' },
 };
 const pal = () => THEMES[config.theme] || THEMES.aurora;
 const aColor = (a) => pal()[a.key];
 const accent = (s) => C(pal().accent)(s);
+const orch = (s) => C(pal().orch)(s);
 
 // ---------- base helpers ----------
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -89,7 +90,7 @@ function geminiEntry() {
   if (shim) { const js = join(dirname(shim), 'node_modules', '@google', 'gemini-cli', 'bundle', 'gemini.js'); try { if (statSync(js).isFile()) return js; } catch {} }
   return null;
 }
-const PATHS = { codex: which('codex'), claude: which('claude'), grok: which('grok'), geminiJs: geminiEntry(), gemini: which('gemini') };
+const PATHS = { codex: which('codex'), claude: which('claude'), grok: which('grok'), geminiJs: geminiEntry(), gemini: which('gemini'), vibe: which('vibe') };
 
 // ---------- agents ----------
 const AGENTS = [
@@ -116,6 +117,12 @@ const AGENTS = [
     build: (txt) => {
       const args = ['-p', '--output-format', 'text']; if (SKIP) args.push('--dangerously-skip-permissions');
       return { cmd: PATHS.claude || 'claude', args, stdin: txt, shell: !PATHS.claude };
+    } },
+  { name: 'Vibe', key: 'vibe',
+    build: (txt) => {
+      const args = ['-p', txt, '--output', 'text', '--trust', '--workdir', cwd];
+      if (SKIP) args.push('--yolo');
+      return { cmd: PATHS.vibe || 'vibe', args, stdin: null, shell: !PATHS.vibe };
     } },
 ];
 const NAMES = AGENTS.map(a => a.name);
@@ -261,22 +268,25 @@ async function boot() {
 function logo() {
   console.log('');
   console.log('  ' + bold('H Y P E R S W A R M'));
-  console.log('  ' + grey('an AI engineering team. one terminal.'));
+  console.log('  ' + grey('ask anything - an orchestrator routes it to the right engineer.'));
   console.log('  ' + AGENTS.map(a => dotOf(a) + grey(' ' + a.name.toLowerCase())).join('   '));
-  console.log('  ' + grey('tools: ') + (SKIP ? GOOD('ON') + grey(' (edits files & runs commands)') : grey('off  (--safe)')) + grey('   theme: ' + config.theme));
+  console.log('  ' + grey('tools: ') + (SKIP ? GOOD('ON') + grey(' (edits files & runs commands)') : grey('off  (--safe)')) + grey('   route: ') + (config.smart ? orch('smart') : grey('fast')) + grey('   theme: ' + config.theme));
   console.log('  ' + grey('dir:   ') + grey(cwd));
-  console.log('  ' + grey('/help for commands'));
+  console.log('  ' + grey('just type a question  ·  /team to discuss with everyone  ·  /help'));
   console.log('');
 }
 function help() {
   logo();
-  console.log(grey('  works like a small eng team: discuss, then assign the work.'));
-  console.log(grey('  <message>             talk it through with the team'));
-  console.log(grey('  @<agent> <message>    direct it to one engineer'));
+  console.log(grey('  the orchestrator reads your question and routes it to the best engineer.'));
+  console.log(grey('  <question>            orchestrator picks the right engineer & answers'));
+  console.log(grey('  /route <agent> <q>    force one engineer to answer'));
+  console.log(grey('  /smart                toggle smart routing (an engineer picks) vs fast'));
+  console.log(grey('  /team <message>       discuss it with the whole team (group chat)'));
+  console.log(grey('  /quick <q>            quick poll - everyone answers once'));
+  console.log(grey('  @<agent> <message>    direct it to one engineer (they build it)'));
   console.log(grey('  /solo <agent> <task>  assign to one - they build it (files, commands)'));
   console.log(grey('  /build <task>         team plans, then one engineer implements'));
   console.log(grey('  /skill <name> [args]  run a skill   ·   /skills to list'));
-  console.log(grey('  /quick <q>            quick opinion poll, everyone answers once'));
   console.log(grey('  /agents  /agent on|off <name>   /status   /setup'));
   console.log(grey('  /cd <path>  /pwd   /theme <name>   /rounds 1-5   /save [file]'));
   console.log(grey('  /retry   /clear   /help   /exit'));
@@ -290,7 +300,7 @@ const histText = () => history.slice(-6).map(h => `${h.role}: ${h.text}`).join('
 const transcriptText = (limit = 26) => history.slice(-limit).map(h => `${h.role === 'User' ? 'You' : h.role}: ${h.text}`).join('\n');
 function chatPrompt(agent) {
   return [
-    `This is a work chat for a small engineering team in a terminal. Members: "You" (the human lead) and four AI engineers - ${NAMES.join(', ')}. You are ${agent.name}.`,
+    `This is a work chat for a small engineering team in a terminal. Members: "You" (the human lead) and ${NAMES.length} AI engineers - ${NAMES.join(', ')}. You are ${agent.name}.`,
     `Communicate like a focused, professional coworker: concise and substantive, no small talk, jokes, or filler. Disagreement is fine - back it with reasoning.`,
     `React to the latest messages: build on a point, flag a risk, or add what's missing. Address a teammate by name when replying to them. Don't repeat what's been said; if you have nothing to add, reply exactly: (pass)`,
     `You have full tool access - read/write files and run commands in the working directory (${cwd}). When the user asks for real work, coordinate: state what you'll take, don't duplicate a teammate's task, prefer one owner per file. For a sizable build, expect the user to hand it to one engineer via /solo or /build.`,
@@ -309,13 +319,100 @@ function soloPrompt(agent, user) {
 function swarmPrompt(agent, user) {
   const others = NAMES.filter(n => n !== agent.name).join(', ');
   return [
-    `You are ${agent.name}, one of four AI engineers giving a quick take in a shared terminal (alongside ${others}).`,
-    `All four answer at once, so give your own best, distinctive take - don't defer to the others.`,
+    `You are ${agent.name}, one of several AI engineers giving a quick take in a shared terminal (alongside ${others}).`,
+    `Everyone answers at once, so give your own best, distinctive take - don't defer to the others.`,
     `This is a quick opinion poll: answer from your own knowledge; do NOT run commands or change files here (use /solo for actual work).`,
     `Be concise and professional. No preamble, no sign-off. Speak in first person as ${agent.name}.`,
     history.length ? `\nRecent conversation (context):\n${histText()}\n` : ``,
     `\nUser request:\n${user}\n\nYour response as ${agent.name}:`,
   ].join('\n');
+}
+
+// ---------- orchestrator (router) ----------
+// Each engineer's lane. The orchestrator reads the question and routes it to the best fit.
+const SPECIALTY = {
+  Codex:  { cat: 'code',     blurb: 'writing & running code, debugging, refactors, shell/file work' },
+  Claude: { cat: 'reasoning', blurb: 'deep reasoning, architecture, analysis, long-form writing' },
+  Gemini: { cat: 'research',  blurb: 'research, summaries, comparisons, broad factual questions' },
+  Grok:   { cat: 'realtime',  blurb: 'current events, real-time info, math/logic, blunt takes' },
+  Vibe:   { cat: 'quick',     blurb: 'fast general answers and lightweight coding help' },
+};
+// Heuristic signals - zero-latency routing (the "fast engine": one call, no fan-out).
+const ROUTE_SIGNALS = {
+  Codex:  [/\bcode\b/i, /\bbug\b/i, /\berror\b/i, /stack ?trace/i, /\brefactor\b/i, /\bimplement\b/i, /\bfunction\b/i, /\bcompile\b/i, /\bbuild\b/i, /\bscript\b/i, /\bregex\b/i, /\bnpm\b/i, /\bgit\b/i, /\btests?\b/i, /\bdebug\b/i, /\bclass\b/i, /\binstall\b/i, /\bdeploy\b/i, /\bdocker\b/i, /\bsql\b/i, /\bapi\b/i, /\bfile\b/i, /\bcommand\b/i, /\brun\b/i],
+  Grok:   [/\btoday\b/i, /\bnews\b/i, /\blatest\b/i, /\bcurrent(ly)?\b/i, /right now/i, /\bhappening\b/i, /\bprice\b/i, /\bstock\b/i, /\b202[5-9]\b/i, /\bscore\b/i, /\belection\b/i, /\bweather\b/i, /who won/i, /\bcalculate\b/i, /\bmath\b/i],
+  Gemini: [/\bresearch\b/i, /\bsummar/i, /\boverview\b/i, /\bcompare\b/i, /\bhistory\b/i, /who is\b/i, /what is\b/i, /\bdefine\b/i, /\bdefinition\b/i, /\blist\b/i, /\bexamples?\b/i, /how does\b/i, /\bfacts?\b/i],
+  Claude: [/\bwhy\b/i, /\banalyze\b/i, /\banalysis\b/i, /\bdesign\b/i, /\barchitect/i, /trade-?off/i, /\breason/i, /\bwrite\b/i, /\bessay\b/i, /\breview\b/i, /pros and cons/i, /\bstrategy\b/i, /\bplan\b/i, /should i\b/i, /\bcritique\b/i, /\bexplain\b/i],
+  Vibe:   [/\bquick(ly)?\b/i, /\bfast\b/i, /\bsimple\b/i, /\btl;?dr\b/i, /\bbrief/i, /one[- ]liner/i, /\bjust\b/i],
+};
+function routeHeuristic(user, agents) {
+  const scores = {};
+  for (const a of agents) {
+    const sig = ROUTE_SIGNALS[a.name] || [];
+    scores[a.name] = sig.reduce((n, re) => n + (re.test(user) ? 1 : 0), 0);
+  }
+  const best = agents.slice().sort((x, y) => (scores[y.name] - scores[x.name]))[0];
+  const top = scores[best.name] || 0;
+  // nothing matched -> fall back to the configured default (or first available)
+  let agent = top > 0 ? best : (findAgent(config.defaultAgent) && activeAgents().includes(findAgent(config.defaultAgent)) ? findAgent(config.defaultAgent) : agents[0]);
+  if (!activeAgents().includes(agent)) agent = agents[0];
+  const sp = SPECIALTY[agent.name] || { cat: 'general', blurb: 'general assistance' };
+  return { agent, cat: sp.cat, why: top > 0 ? `best match for ${sp.cat}: ${sp.blurb}` : `no strong signal - routed to default (${sp.blurb})`, scores, mode: 'heuristic' };
+}
+// Optional: let the fastest engineer pick the specialist (one tiny extra call).
+async function smartRoute(user, agents) {
+  const fastest = agents.slice().sort((x, y) => (authState[x.name]?.dt || 9e9) - (authState[y.name]?.dt || 9e9))[0];
+  const roster = agents.map(a => `${a.name} = ${SPECIALTY[a.name].blurb}`).join('\n');
+  const prompt = `You are a router. Given a user request and a roster of engineers, reply with ONLY the single best engineer's name (one word, exactly as written), nothing else.\n\nRoster:\n${roster}\n\nRequest: ${user}\n\nBest engineer:`;
+  const res = await ask(fastest, prompt, { timeout: 45000, retry: false });
+  const pick = agents.find(a => new RegExp(`\\b${a.name}\\b`, 'i').test(res.text)) || agents.find(a => clean(res.text).toLowerCase().includes(a.name.toLowerCase()));
+  if (!pick) return { ...routeHeuristic(user, agents), mode: 'smart->fallback' };
+  const sp = SPECIALTY[pick.name];
+  return { agent: pick, cat: sp.cat, why: `${fastest.name.toLowerCase()} routed this to ${pick.name.toLowerCase()}: ${sp.blurb}`, mode: 'smart' };
+}
+function routedPrompt(agent, user, r) {
+  const sp = SPECIALTY[agent.name] || { blurb: 'general assistance' };
+  return [
+    `You are ${agent.name}. An orchestrator routed this question to you because it fits your strength: ${sp.blurb}.`,
+    `Answer it directly and well - concise but complete, professional, no preamble or sign-off.`,
+    SKIP ? `You have full tool access in the working directory (${cwd}). If the task needs real work (create/edit files, run commands), do it and report what you did; otherwise just answer.` : `Read-only session: answer from your knowledge, do not change files.`,
+    history.length > 1 ? `\nConversation so far:\n${transcriptText(10)}\n` : ``,
+    `\nQuestion:\n${user}\n\n${agent.name}:`,
+  ].join('\n');
+}
+function printRouting(r) {
+  console.log('');
+  console.log(`  ${orch('◇')} ${orch('orchestrator')} ${grey('routed to')} ${C(aColor(r.agent))('● ' + r.agent.name.toLowerCase())}  ${grey('·')}  ${C(aColor(r.agent))(r.cat)}`);
+  console.log(`     ${faint(r.why)}`);
+  console.log('');
+}
+function printAnswer(res, agent, r) {
+  const paint = C(aColor(agent)), bar = paint('│');
+  const w = Math.min(cols() - 6, 96);
+  console.log(`  ${paint('●')} ${paint(bold(agent.name.toLowerCase()))}  ${grey('· ' + r.cat)}`);
+  for (const l of wrap(res.text, w)) console.log(`  ${bar}  ${l}`);
+  console.log(`  ${faint('└─ answered by ' + agent.name.toLowerCase() + (res.dt ? ' · ' + (res.dt / 1000).toFixed(1) + 's' : ''))}`);
+  console.log('');
+}
+async function routeRound(user) {
+  const agents = activeAgents();
+  if (!agents.length) return noEngineers();
+  lastUser = user; history.push({ role: 'User', text: user });
+  let r;
+  if (config.smart && agents.length > 1) {
+    hide(); let i = 0;
+    const sp = setInterval(() => process.stdout.write(`\r  ${orch('◇')} ${grey('orchestrating ' + SPIN[i++ % SPIN.length])}   `), 90);
+    r = await smartRoute(user, agents);
+    clearInterval(sp); process.stdout.write('\r\x1b[2K'); show();
+  } else {
+    r = routeHeuristic(user, agents);
+  }
+  printRouting(r);
+  hide(); const stop = miniSpin(r.agent);
+  const res = await ask(r.agent, routedPrompt(r.agent, user, r), {});
+  stop(); show();
+  printAnswer(res, r.agent, r);
+  history.push({ role: res.name, text: res.text });
 }
 
 // ---------- rounds ----------
@@ -407,8 +504,8 @@ async function runSkill(rest) {
 }
 
 // ---------- Phase 1: setup / authorization wizard ----------
-const LOGIN = { Codex: 'codex login', Gemini: 'gemini   (then choose sign-in / paste API key)', Grok: 'grok   (then complete sign-in)', Claude: 'claude   (then /login)' };
-const INSTALL = { Codex: 'npm i -g @openai/codex', Gemini: 'npm i -g @google/gemini-cli', Grok: 'install the grok CLI (xAI)', Claude: 'npm i -g @anthropic-ai/claude-code' };
+const LOGIN = { Codex: 'codex login', Gemini: 'gemini   (then choose sign-in / paste API key)', Grok: 'grok   (then complete sign-in)', Claude: 'claude   (then /login)', Vibe: 'vibe --setup   (paste Mistral API key)' };
+const INSTALL = { Codex: 'npm i -g @openai/codex', Gemini: 'npm i -g @google/gemini-cli', Grok: 'install the grok CLI (xAI)', Claude: 'npm i -g @anthropic-ai/claude-code', Vibe: 'install the Mistral Vibe CLI' };
 async function setupWizard() {
   console.log('');
   console.log('  ' + bold('SETUP') + grey('   -   authorize your engineers on this machine'));
@@ -451,7 +548,7 @@ function listAgents() {
 function status() {
   console.log('\n  ' + bold('status'));
   console.log('  ' + grey('dir:    ') + grey(cwd));
-  console.log('  ' + grey('tools:  ') + (SKIP ? GOOD('ON') : grey('off (--safe)')) + grey('    theme: ') + grey(config.theme) + grey('    rounds: ') + grey(rounds));
+  console.log('  ' + grey('tools:  ') + (SKIP ? GOOD('ON') : grey('off (--safe)')) + grey('    route: ') + (config.smart ? orch('smart') : grey('fast')) + grey('    theme: ') + grey(config.theme) + grey('    rounds: ') + grey(rounds));
   for (const a of AGENTS) console.log(agentLine(a));
   console.log('');
 }
@@ -472,11 +569,12 @@ function saveTranscript(file) {
 
 // ---------- Phase 6: tab autocomplete ----------
 function completer(line) {
-  const base = ['/help', '/setup', '/status', '/agents', '/agent on ', '/agent off ', '/skills', '/skill ', '/skill-add ', '/quick ', '/solo ', '/build ', '/cd ', '/pwd', '/rounds ', '/theme ', '/save', '/clear', '/retry', '/exit'];
+  const base = ['/help', '/setup', '/status', '/agents', '/agent on ', '/agent off ', '/skills', '/skill ', '/skill-add ', '/ask ', '/route ', '/smart', '/team ', '/quick ', '/solo ', '/build ', '/cd ', '/pwd', '/rounds ', '/theme ', '/save', '/clear', '/retry', '/exit'];
   const skills = Object.keys({ ...SKILLS, ...config.skills }).map(s => '/skill ' + s + ' ');
   const ats = NAMES.map(n => '@' + n.toLowerCase() + ' ');
+  const routes = NAMES.map(n => '/route ' + n.toLowerCase() + ' ');
   const themes = Object.keys(THEMES).map(t => '/theme ' + t);
-  const all = [...base, ...skills, ...ats, ...themes];
+  const all = [...base, ...skills, ...ats, ...routes, ...themes];
   const hits = all.filter(c => c.startsWith(line));
   return [hits.length ? hits : [], line];
 }
@@ -493,7 +591,8 @@ async function handle(line) {
   if (t === '/skills') return listSkills();
   if (t === '/pwd') { console.log(grey('  ' + cwd) + '\n'); return; }
   if (t === '/clear') { history.length = 0; console.log(grey('  chat cleared.') + '\n'); return; }
-  if (t === '/retry') { if (lastUser) await converse(lastUser); else console.log(grey('  nothing to retry.') + '\n'); return; }
+  if (t === '/retry') { if (lastUser) await routeRound(lastUser); else console.log(grey('  nothing to retry.') + '\n'); return; }
+  if (t === '/smart') { config.smart = !config.smart; saveConfig(); console.log(grey(`  smart routing ${config.smart ? 'ON - the fastest engineer picks the specialist' : 'off - instant heuristic routing'}.`) + '\n'); return; }
   if (t === '/save' || t.startsWith('/save ')) return saveTranscript(t.length > 5 ? t.slice(6).trim() : '');
   if (t.startsWith('/agent on ')) return setAgent(true, t.slice(10).trim());
   if (t.startsWith('/agent off ')) return setAgent(false, t.slice(11).trim());
@@ -521,8 +620,24 @@ async function handle(line) {
     config.skills[r.slice(0, sp).toLowerCase()] = r.slice(sp + 1); saveConfig(); console.log(grey('  skill saved.') + '\n'); return;
   }
   if (t.startsWith('/skill ')) return runSkill(t.slice(7).trim());
+  if (t.startsWith('/ask ')) return routeRound(t.slice(5).trim());
+  if (t.startsWith('/team ')) return converse(t.slice(6).trim());
   if (t.startsWith('/quick ')) return swarmRound(t.slice(7).trim());
   if (t.startsWith('/build ')) return buildTask(t.slice(7).trim());
+  if (t.startsWith('/route ')) {
+    const rest = t.slice(7).trim(), sp = rest.indexOf(' ');
+    if (sp === -1) { console.log(grey('  usage: /route <agent> <question>') + '\n'); return; }
+    const agent = findAgent(rest.slice(0, sp));
+    if (!agent) { console.log(grey(`  unknown engineer "${rest.slice(0, sp)}". try: ${NAMES.map(n => n.toLowerCase()).join(', ')}`) + '\n'); return; }
+    const q = rest.slice(sp + 1);
+    lastUser = q; history.push({ role: 'User', text: q });
+    const sp2 = SPECIALTY[agent.name] || { cat: 'general' };
+    const r = { agent, cat: sp2.cat, why: 'forced by you', mode: 'forced' };
+    printRouting(r); hide(); const stop = miniSpin(agent);
+    const res = await ask(agent, routedPrompt(agent, q, r), {});
+    stop(); show(); printAnswer(res, agent, r); history.push({ role: res.name, text: res.text });
+    return;
+  }
   if (t.startsWith('/solo ')) {
     const rest = t.slice(6).trim(), sp = rest.indexOf(' ');
     if (sp === -1) { console.log(grey('  usage: /solo <agent> <task>') + '\n'); return; }
@@ -530,11 +645,11 @@ async function handle(line) {
   }
   const at = t.match(/^@(\w+)\s+([\s\S]+)/);
   if (at && findAgent(at[1])) return soloRound(at[1], at[2]);
-  await converse(t);
+  await routeRound(t);
 }
 function cleanup() { show(); try { rmSync(TMP, { recursive: true, force: true }); } catch {} }
 async function main() {
-  if (ONCE) { await boot(); await converse(ONCE); cleanup(); process.exit(0); }
+  if (ONCE) { await boot(); await routeRound(ONCE); cleanup(); process.exit(0); }
   await boot();
   if (!config.setupDone) await setupWizard();
   const rl = createInterface({ input: process.stdin, output: process.stdout, prompt: accent('  ● ') + grey('you  '), completer });
