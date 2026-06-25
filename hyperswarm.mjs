@@ -73,6 +73,15 @@ function stripPass(t) {
   return s;
 }
 const isBad = (t) => /^\((no response|failed to launch)/.test(t || '');
+// A response that's really a CLI crash / auth failure, not an answer (so the orchestrator can reroute).
+const FAIL_SIGS = [
+  /IneligibleTierError|throwIneligible|_doSetupUser/i, /\/bundle\/chunk-/i, /\n\s+at\s+\S+/, // stack dumps
+  /Error authenticating/i, /unexpected critical error/i, /please migrate to/i,
+  /\bnot (logged in|authenticated)\b/i, /please (run\s+\S+\s+)?(log ?in|sign ?in)/i,
+  /(missing|no|invalid)\b.{0,12}\bapi key/i, /is not recognized as an internal/i, /command not found/i,
+  /EADDRINUSE|ECONNREFUSED|ENOTFOUND/i,
+];
+function looksFailed(t) { const s = clean(t); return !s || FAIL_SIGS.some(re => re.test(s)); }
 const TMP = mkdtempSync(join(tmpdir(), 'hyperswarm-'));
 
 // ---------- resolve CLIs on PATH (no shell, so prompts never get re-parsed) ----------
@@ -345,11 +354,21 @@ const ROUTE_SIGNALS = {
   Claude: [/\bwhy\b/i, /\banalyze\b/i, /\banalysis\b/i, /\bdesign\b/i, /\barchitect/i, /trade-?off/i, /\breason/i, /\bwrite\b/i, /\bessay\b/i, /\breview\b/i, /pros and cons/i, /\bstrategy\b/i, /\bplan\b/i, /should i\b/i, /\bcritique\b/i, /\bexplain\b/i],
   Vibe:   [/\bquick(ly)?\b/i, /\bfast\b/i, /\bsimple\b/i, /\btl;?dr\b/i, /\bbrief/i, /one[- ]liner/i, /\bjust\b/i],
 };
+// Strong, specific signals score +2 so they beat generic openers ("what is", "explain")
+// on a tie - e.g. "what is the weather in queens" -> Grok (realtime), not Gemini (research).
+const STRONG_SIGNALS = {
+  Codex:  [/\berror\b/i, /stack ?trace/i, /\btraceback\b/i, /\bexception\b/i, /\bregex\b/i, /\bcompile\b/i, /\brefactor\b/i],
+  Grok:   [/\bweather\b/i, /\bforecast\b/i, /\btemperature\b/i, /\bnews\b/i, /\bstock\b/i, /\bprice\b/i, /\belection\b/i, /right now/i, /\btoday\b/i, /\blatest\b/i, /who won/i],
+  Gemini: [/\bresearch\b/i, /\bsummar/i],
+  Claude: [/\banalyze\b/i, /\barchitect/i, /trade-?off/i, /\bcritique\b/i, /pros and cons/i],
+  Vibe:   [/\btl;?dr\b/i, /one[- ]liner/i],
+};
 function routeHeuristic(user, agents) {
   const scores = {};
   for (const a of agents) {
-    const sig = ROUTE_SIGNALS[a.name] || [];
-    scores[a.name] = sig.reduce((n, re) => n + (re.test(user) ? 1 : 0), 0);
+    const sig = ROUTE_SIGNALS[a.name] || [], strong = STRONG_SIGNALS[a.name] || [];
+    scores[a.name] = sig.reduce((n, re) => n + (re.test(user) ? 1 : 0), 0)
+                   + strong.reduce((n, re) => n + (re.test(user) ? 2 : 0), 0);
   }
   const best = agents.slice().sort((x, y) => (scores[y.name] - scores[x.name]))[0];
   const top = scores[best.name] || 0;
@@ -408,10 +427,25 @@ async function routeRound(user) {
     r = routeHeuristic(user, agents);
   }
   printRouting(r);
-  hide(); const stop = miniSpin(r.agent);
-  const res = await ask(r.agent, routedPrompt(r.agent, user, r), {});
-  stop(); show();
-  printAnswer(res, r.agent, r);
+  const tried = new Set();
+  let res, agent = r.agent;
+  for (let attempt = 0; attempt < agents.length; attempt++) {
+    tried.add(agent.name);
+    hide(); const stop = miniSpin(agent);
+    res = await ask(agent, routedPrompt(agent, user, r), {});
+    stop(); show();
+    if (!(isBad(res.text) || looksFailed(res.text))) break;
+    // this engineer crashed / isn't authorized - bench it for the session and reroute to the next best
+    authState[agent.name] = { ok: false }; config.auth = authState; saveConfig();
+    const remaining = activeAgents().filter(a => !tried.has(a.name));
+    if (!remaining.length) { console.log(`  ${faint(agent.name.toLowerCase() + ' is unavailable, and no other engineer is free. try /setup.')}\n`); return; }
+    const next = routeHeuristic(user, remaining).agent;
+    const sp = SPECIALTY[next.name] || { cat: 'general', blurb: 'general assistance' };
+    console.log(`  ${faint(agent.name.toLowerCase() + ' unavailable (not authorized / crashed) - rerouting to ' + next.name.toLowerCase())}\n`);
+    r = { agent: next, cat: sp.cat, why: `rerouted: ${agent.name.toLowerCase()} unavailable -> ${sp.blurb}`, mode: 'reroute' };
+    printRouting(r); agent = next;
+  }
+  printAnswer(res, agent, r);
   history.push({ role: res.name, text: res.text });
 }
 
